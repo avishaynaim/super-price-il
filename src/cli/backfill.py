@@ -39,6 +39,7 @@ from ..scraper.chains.binaprojects import (
 from ..scraper.chains.custom import (
     MegaScraper, make_client_for_mega,
     HaziHinamScraper, make_client_for_hazi_hinam,
+    SuperPharmScraper, make_client_for_superpharm,
 )
 from ..scraper.registry import BY_CODE
 
@@ -65,6 +66,7 @@ SCRAPERS = {
     "victory":             LaibcatalogScraper,
     "mega":                MegaScraper,
     "hazi_hinam":          HaziHinamScraper,
+    "super_pharm":         SuperPharmScraper,
     # All binaprojects chains use the same scraper — only the spec differs:
     "king_store":          BinaprojectsScraper,
     "maayan2000":          BinaprojectsScraper,
@@ -95,7 +97,7 @@ BINAPROJECTS_CODES = {
 NEEDS_INSECURE = (
     PUBLISHEDPRICES_CODES
     | BINAPROJECTS_CODES
-    | {"victory", "mega", "hazi_hinam"}
+    | {"victory", "mega", "hazi_hinam", "super_pharm"}
 )
 
 
@@ -119,6 +121,8 @@ async def run_chain(
         client_cm = make_client_for_mega()
     elif code == "hazi_hinam":
         client_cm = make_client_for_hazi_hinam()
+    elif code == "super_pharm":
+        client_cm = make_client_for_superpharm()
     elif code in NEEDS_INSECURE:
         client_cm = make_client_for_publishedprices()
     else:
