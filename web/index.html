@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>super-price-il · מודיעין מחירים</title>
+<link rel="stylesheet" href="/style.css"/>
+</head>
+<body>
+<header>
+  <h1>super-price-il</h1>
+  <p class="tag">מחירי סופרמרקטים בישראל — כל הרשתות במקום אחד</p>
+  <div class="health" id="health">טוען…</div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="search">חיפוש</button>
+  <button class="tab"        data-tab="nl">חיפוש חכם (AI)</button>
+  <button class="tab"        data-tab="trends">גרף מחיר</button>
+  <button class="tab"        data-tab="receipt">קבלה</button>
+</nav>
+
+<!-- search tab -->
+<section class="pane active" id="pane-search">
+  <form id="form-search">
+    <input name="q" placeholder="שם מוצר או ברקוד…" autocomplete="off"/>
+    <select name="chain">
+      <option value="">כל הרשתות</option>
+    </select>
+    <input name="city" placeholder="עיר (חלקית)"/>
+    <button type="submit">חפש</button>
+  </form>
+  <div class="results" id="results-search"></div>
+</section>
+
+<!-- NL -->
+<section class="pane" id="pane-nl">
+  <form id="form-nl">
+    <input name="query" placeholder="למשל: איפה הכי זול קפה עלית 200 גרם" style="flex:1"/>
+    <button type="submit">שאל</button>
+  </form>
+  <div class="nl-explain" id="nl-explain"></div>
+  <div class="nl-tool"    id="nl-tool"></div>
+  <div class="results"    id="results-nl"></div>
+</section>
+
+<!-- trends -->
+<section class="pane" id="pane-trends">
+  <form id="form-trends">
+    <input name="barcode" placeholder="ברקוד (13 ספרות)"/>
+    <select name="days">
+      <option value="7">7 ימים</option>
+      <option value="14">14 ימים</option>
+      <option value="30">30 ימים</option>
+    </select>
+    <button type="submit">הצג</button>
+  </form>
+  <div id="trend-table"></div>
+</section>
+
+<!-- receipt -->
+<section class="pane" id="pane-receipt">
+  <form id="form-receipt" enctype="multipart/form-data">
+    <input type="file" name="file" accept="image/*,application/pdf"/>
+    <input name="city" placeholder="העיר שלך (לחיפוש חלופות)"/>
+    <button type="submit">העלה וחשב חיסכון</button>
+  </form>
+  <div id="receipt-result"></div>
+</section>
+
+<!-- modal for product detail (compare across chains) -->
+<div class="modal hidden" id="modal">
+  <div class="modal-body">
+    <button class="close" onclick="closeModal()">✕</button>
+    <h2 id="modal-title">—</h2>
+    <div id="modal-content"></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
