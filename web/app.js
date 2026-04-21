@@ -36,9 +36,10 @@ function renderRows(root, rows, options = {}) {
   rows.forEach(r => {
     const d = document.createElement("div");
     d.className = "row";
+    const promoBadge = r.has_promo ? '<span class="promo-badge" title="במבצע">%</span>' : "";
     d.innerHTML = `
       <div>
-        <div class="nm">${r.name || "—"}</div>
+        <div class="nm">${r.name || "—"} ${promoBadge}</div>
         <div class="mf">${r.manufacturer || ""} <span class="bc">${r.barcode}</span></div>
       </div>
       <div class="price min">${shekel(r.min_price)}</div>
@@ -132,24 +133,41 @@ function openProduct(barcode) {
   c.innerHTML = '<div class="loading">…</div>';
   m.classList.remove("hidden");
 
-  api(`/api/products/${encodeURIComponent(barcode)}`).then(p => {
+  Promise.all([
+    api(`/api/products/${encodeURIComponent(barcode)}`),
+    api(`/api/compare/${encodeURIComponent(barcode)}`),
+    api(`/api/promotions/${encodeURIComponent(barcode)}`).catch(() => []),
+  ]).then(([p, cmp, promos]) => {
     document.getElementById("modal-title").textContent = `${p.name || barcode}  ·  ${barcode}`;
-    api(`/api/compare/${encodeURIComponent(barcode)}`).then(cmp => {
-      if (!cmp.length) { c.innerHTML = '<div class="empty">אין מחירים</div>'; return; }
-      const cheapest = cmp[0];
-      let html = '<h3 style="margin:10px 0 6px">השוואה בין רשתות</h3><table><thead><tr><th>רשת</th><th>הכי זול</th><th>חנויות</th></tr></thead><tbody>';
-      for (const r of cmp) {
-        const cls = r.chain_code === cheapest.chain_code ? "cheapest" : "";
-        html += `<tr><td>${r.chain_name_he}</td><td class="num ${cls}">${shekel(r.min_price)}</td><td class="num">${r.stores_with}</td></tr>`;
+    if (!cmp.length) { c.innerHTML = '<div class="empty">אין מחירים</div>'; return; }
+    const cheapest = cmp[0];
+    let html = '<h3 style="margin:10px 0 6px">השוואה בין רשתות</h3><table><thead><tr><th>רשת</th><th>הכי זול</th><th>חנויות</th></tr></thead><tbody>';
+    for (const r of cmp) {
+      const cls = r.chain_code === cheapest.chain_code ? "cheapest" : "";
+      html += `<tr><td>${r.chain_name_he}</td><td class="num ${cls}">${shekel(r.min_price)}</td><td class="num">${r.stores_with}</td></tr>`;
+    }
+    html += "</tbody></table>";
+
+    if (promos && promos.length) {
+      html += `<h3 style="margin:16px 0 6px">מבצעים פעילים (${promos.length})</h3>
+        <table><thead><tr><th>רשת</th><th>תיאור</th><th>מינ׳</th><th>הנחה</th><th>עד</th></tr></thead><tbody>`;
+      for (const pr of promos.slice(0, 20)) {
+        const disc = pr.discount_price != null ? shekel(pr.discount_price)
+                   : (pr.discount_rate != null ? pr.discount_rate + "%" : "—");
+        html += `<tr><td>${pr.chain_name_he}</td><td>${pr.description || ""}</td>
+          <td class="num">${pr.min_qty ?? ""}</td>
+          <td class="num">${disc}</td>
+          <td class="num">${(pr.ends_at || "").slice(0, 10)}</td></tr>`;
       }
       html += "</tbody></table>";
-      html += '<h3 style="margin:16px 0 6px">כל החנויות</h3><table><thead><tr><th>רשת</th><th>חנות</th><th>עיר</th><th>מחיר</th><th>עדכון</th></tr></thead><tbody>';
-      for (const r of p.prices.slice(0, 80)) {
-        html += `<tr><td>${r.chain_name_he}</td><td>${r.store_name ?? r.store_id}</td><td>${r.store_city || ""}</td><td class="num">${shekel(r.price)}</td><td class="num">${r.updated_at?.slice(0,16) || ""}</td></tr>`;
-      }
-      html += "</tbody></table>";
-      c.innerHTML = html;
-    });
+    }
+
+    html += '<h3 style="margin:16px 0 6px">כל החנויות</h3><table><thead><tr><th>רשת</th><th>חנות</th><th>עיר</th><th>מחיר</th><th>עדכון</th></tr></thead><tbody>';
+    for (const r of p.prices.slice(0, 80)) {
+      html += `<tr><td>${r.chain_name_he}</td><td>${r.store_name ?? r.store_id}</td><td>${r.store_city || ""}</td><td class="num">${shekel(r.price)}</td><td class="num">${r.updated_at?.slice(0,16) || ""}</td></tr>`;
+    }
+    html += "</tbody></table>";
+    c.innerHTML = html;
   }).catch(e => c.innerHTML = `<div class="err">${e.detail || e}</div>`);
 }
 function closeModal() { document.getElementById("modal").classList.add("hidden"); }
