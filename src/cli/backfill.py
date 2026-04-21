@@ -40,6 +40,7 @@ from ..scraper.chains.custom import (
     MegaScraper, make_client_for_mega,
     HaziHinamScraper, make_client_for_hazi_hinam,
     SuperPharmScraper, make_client_for_superpharm,
+    WoltScraper, make_client_for_wolt,
 )
 from ..scraper.registry import BY_CODE
 
@@ -64,9 +65,12 @@ SCRAPERS = {
     "super_yuda":          PublishedPricesScraper,
     "stop_market":         PublishedPricesScraper,   # different Cerberus host; scraper reads from spec.portal_url
     "victory":             LaibcatalogScraper,
+    "machsanei_hashuk":    LaibcatalogScraper,
+    "cohen_h":             LaibcatalogScraper,
     "mega":                MegaScraper,
     "hazi_hinam":          HaziHinamScraper,
     "super_pharm":         SuperPharmScraper,
+    "wolt":                WoltScraper,
     # All binaprojects chains use the same scraper — only the spec differs:
     "king_store":          BinaprojectsScraper,
     "maayan2000":          BinaprojectsScraper,
@@ -97,7 +101,8 @@ BINAPROJECTS_CODES = {
 NEEDS_INSECURE = (
     PUBLISHEDPRICES_CODES
     | BINAPROJECTS_CODES
-    | {"victory", "mega", "hazi_hinam", "super_pharm"}
+    | {"victory", "machsanei_hashuk", "cohen_h", "mega", "hazi_hinam",
+       "super_pharm", "wolt"}
 )
 
 
@@ -113,7 +118,7 @@ async def run_chain(
         console.print(f"[yellow]no scraper yet for {code}; skipping[/yellow]")
         return (0, 0)
 
-    if code == "victory":
+    if code in {"victory", "machsanei_hashuk", "cohen_h"}:
         client_cm = make_client_for_laibcatalog()
     elif code in BINAPROJECTS_CODES:
         client_cm = make_client_for_binaprojects()
@@ -123,6 +128,8 @@ async def run_chain(
         client_cm = make_client_for_hazi_hinam()
     elif code == "super_pharm":
         client_cm = make_client_for_superpharm()
+    elif code == "wolt":
+        client_cm = make_client_for_wolt()
     elif code in NEEDS_INSECURE:
         client_cm = make_client_for_publishedprices()
     else:
