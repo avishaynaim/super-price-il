@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 from ..parser.pricefull import PriceRow
+from ..parser.promofull import PromoRow
 from ..parser.stores import StoreRow
 
 
@@ -81,6 +82,64 @@ def upsert_product(conn: sqlite3.Connection, row: PriceRow) -> int:
     )
     rid = conn.execute("SELECT id FROM products WHERE barcode = ?", (row.barcode,)).fetchone()[0]
     return rid
+
+
+def upsert_promotion(
+    conn: sqlite3.Connection,
+    chain_id: int,
+    store_id: int | None,
+    p: PromoRow,
+) -> int:
+    """Insert or update a promotion and replace its item list. Returns promotion id."""
+    ts = now_iso()
+    conn.execute(
+        """
+        INSERT INTO promotions(
+            chain_id, store_id, promo_code, description, starts_at, ends_at,
+            reward_type, min_qty, discount_price, discount_rate, fetched_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chain_id, promo_code, starts_at) DO UPDATE SET
+            store_id       = excluded.store_id,
+            description    = excluded.description,
+            ends_at        = excluded.ends_at,
+            reward_type    = excluded.reward_type,
+            min_qty        = excluded.min_qty,
+            discount_price = excluded.discount_price,
+            discount_rate  = excluded.discount_rate,
+            fetched_at     = excluded.fetched_at
+        """,
+        (chain_id, store_id, p.promo_code, p.description, p.starts_at, p.ends_at,
+         p.reward_type, p.min_qty, p.discount_price, p.discount_rate, ts),
+    )
+    pid = conn.execute(
+        "SELECT id FROM promotions WHERE chain_id = ? AND promo_code = ? AND COALESCE(starts_at,'') = COALESCE(?, '')",
+        (chain_id, p.promo_code, p.starts_at),
+    ).fetchone()[0]
+
+    if p.item_barcodes:
+        conn.execute("DELETE FROM promotion_items WHERE promotion_id = ?", (pid,))
+        for bc in p.item_barcodes:
+            pr = conn.execute("SELECT id FROM products WHERE barcode = ?", (bc,)).fetchone()
+            if not pr:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO promotion_items(promotion_id, product_id) VALUES (?, ?)",
+                (pid, pr[0]),
+            )
+    return pid
+
+
+def insert_promotions(
+    conn: sqlite3.Connection,
+    chain_id: int,
+    store_id: int | None,
+    rows: Iterable[PromoRow],
+) -> int:
+    count = 0
+    for p in rows:
+        upsert_promotion(conn, chain_id, store_id, p)
+        count += 1
+    return count
 
 
 def insert_observations(
