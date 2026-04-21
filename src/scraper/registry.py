@@ -257,6 +257,15 @@ CHAINS: list[ChainSpec] = [
         notes="Paz-group sub-brand.",
     ),
     ChainSpec(
+        code="super_pharm",
+        name_he="סופר פארם",
+        name_en="Super-Pharm",
+        portal_url="http://prices.super-pharm.co.il/",
+        auth_kind="custom",
+        chain_id="7290172900007",
+        notes="Paginated HTML grid with direct /Download/<name>.gz?bucketName=... links.",
+    ),
+    ChainSpec(
         code="stop_market",
         name_he="סטופ מרקט",
         name_en="Stop Market",
