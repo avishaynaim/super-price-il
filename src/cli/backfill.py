@@ -53,6 +53,15 @@ SCRAPERS = {
     # Re-enabled 2026-04-21 — gov.il confirms they serve via Cerberus:
     "osher_ad":            PublishedPricesScraper,
     "keshet":              PublishedPricesScraper,
+    # Added 2026-04-21 — more publishedprices users from gov.il:
+    "dor_alon":            PublishedPricesScraper,
+    "super_cofix":         PublishedPricesScraper,
+    "politzer":            PublishedPricesScraper,
+    "salach_dabah":        PublishedPricesScraper,
+    "freshmarket":         PublishedPricesScraper,
+    "paz_yellow":          PublishedPricesScraper,
+    "super_yuda":          PublishedPricesScraper,
+    "stop_market":         PublishedPricesScraper,   # different Cerberus host; scraper reads from spec.portal_url
     "victory":             LaibcatalogScraper,
     "mega":                MegaScraper,
     "hazi_hinam":          HaziHinamScraper,
@@ -69,13 +78,10 @@ SCRAPERS = {
     "ktshivuk":            BinaprojectsScraper,
 }
 
-# Chains whose HTTPS cert chain doesn't validate on this proot env.
-NEEDS_INSECURE = {
+PUBLISHEDPRICES_CODES = {
     "rami_levi", "yohananof", "tiv_taam", "osher_ad", "keshet",
-    "victory", "mega", "hazi_hinam",
-    "king_store", "maayan2000", "good_pharm", "zolvebegadol",
-    "supersapir", "superbareket", "shuk_hayir", "shefa_berkat_hashem",
-    "citymarket_kiryatgat", "ktshivuk",
+    "dor_alon", "super_cofix", "politzer", "salach_dabah",
+    "freshmarket", "paz_yellow", "super_yuda", "stop_market",
 }
 
 # Codes whose portals are on the binaprojects.com platform.
@@ -84,6 +90,13 @@ BINAPROJECTS_CODES = {
     "supersapir", "superbareket", "shuk_hayir", "shefa_berkat_hashem",
     "citymarket_kiryatgat", "ktshivuk",
 }
+
+# Chains whose HTTPS cert chain doesn't validate on this proot env.
+NEEDS_INSECURE = (
+    PUBLISHEDPRICES_CODES
+    | BINAPROJECTS_CODES
+    | {"victory", "mega", "hazi_hinam"}
+)
 
 
 async def run_chain(
