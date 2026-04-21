@@ -1,0 +1,20 @@
+[Unit]
+Description=super-price-il daily price ingest
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Edit WorkingDirectory to match where the repo lives on the host.
+WorkingDirectory=/opt/super-price-il
+ExecStart=/opt/super-price-il/scripts/daily_backfill.sh
+# Give HTTP listings + large gzip parses room; tune if needed.
+TimeoutStartSec=3600
+Nice=10
+# Install requirements once via pip; no venv assumed for a single-purpose host.
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
