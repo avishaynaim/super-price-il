@@ -23,28 +23,56 @@ from ..db.upsert import (
 )
 from ..parser import pricefull, stores as stores_parser
 from ..scraper.chains.shufersal import ShufersalScraper
+from ..scraper.chains.publishedprices import (
+    PublishedPricesScraper,
+    make_client_for_publishedprices,
+)
+from ..scraper.chains.laibcatalog import (
+    LaibcatalogScraper,
+    make_client_for_laibcatalog,
+)
 from ..scraper.registry import BY_CODE
 
 app = typer.Typer(help="Backfill price data into prices.db")
 console = Console()
 
 SCRAPERS = {
-    "shufersal": ShufersalScraper,
-    # add rami_levi, victory, ... as implemented
+    "shufersal":  ShufersalScraper,
+    "rami_levi":  PublishedPricesScraper,
+    "yohananof":  PublishedPricesScraper,
+    "tiv_taam":   PublishedPricesScraper,
+    "victory":    LaibcatalogScraper,
 }
 
+# Chains whose HTTPS cert chain doesn't validate on this proot env.
+NEEDS_INSECURE = {"rami_levi", "yohananof", "tiv_taam", "victory"}
 
-async def run_chain(code: str, since: datetime, limit: int | None) -> tuple[int, int]:
+
+async def run_chain(
+    code: str,
+    since: datetime,
+    limit: int | None,
+    kinds: set[str] | None = None,
+) -> tuple[int, int]:
     spec = BY_CODE[code]
     scraper_cls = SCRAPERS.get(code)
     if scraper_cls is None:
         console.print(f"[yellow]no scraper yet for {code}; skipping[/yellow]")
         return (0, 0)
 
-    headers = {"User-Agent": "super-price-il/0.1 (research)"}
-    async with httpx.AsyncClient(headers=headers, timeout=60, follow_redirects=True) as client:
+    if code == "victory":
+        client_cm = make_client_for_laibcatalog()
+    elif code in NEEDS_INSECURE:
+        client_cm = make_client_for_publishedprices()
+    else:
+        client_cm = httpx.AsyncClient(
+            headers={"User-Agent": "super-price-il/0.1 (research)"},
+            timeout=60,
+            follow_redirects=True,
+        )
+    async with client_cm as client:
         scraper = scraper_cls(spec, client)
-        files = await scraper.run(since=since, limit=limit)
+        files = await scraper.run(since=since, limit=limit, kinds=kinds)
 
     conn = connect()
     chain_id = chain_id_for_code(conn, code)
@@ -92,6 +120,7 @@ def main(
     days: int = typer.Option(1, help="how many days back to fetch (default: 1)"),
     retain: int = typer.Option(7, help="days of history to keep in DB + raw/ (default: 7)"),
     limit: int = typer.Option(0, help="cap files per chain (0 = no cap)"),
+    kinds: str = typer.Option("", help="comma-sep subset: PriceFull,Price,PromoFull,Promo,Stores,StoresFull"),
     no_prune: bool = typer.Option(False, "--no-prune", help="skip retention prune after scrape"),
 ) -> None:
     migrate()
@@ -100,10 +129,11 @@ def main(
     since = datetime.now(timezone.utc) - timedelta(days=days)
     chains = list(SCRAPERS.keys()) if chain == "all" else [chain]
     cap = limit or None
+    kind_set = {k.strip() for k in kinds.split(",") if k.strip()} or None
 
     for c in chains:
         console.rule(f"[bold]{c}")
-        files_ok, rows = asyncio.run(run_chain(c, since, cap))
+        files_ok, rows = asyncio.run(run_chain(c, since, cap, kind_set))
         console.print(f"{c}: files_ok={files_ok} rows={rows}")
 
     if not no_prune:
