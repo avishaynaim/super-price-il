@@ -275,6 +275,26 @@ CHAINS: list[ChainSpec] = [
         notes="Paz-group sub-brand.",
     ),
     ChainSpec(
+        code="citymarket",
+        name_he="סיטי מרקט (ראשי)",
+        name_en="CityMarket",
+        portal_url="https://www.citymarket-shops.co.il/",
+        auth_kind="custom",
+        chain_id="7290000000003",
+        notes="Server-rendered table with /downloadFile/<uuid> links; "
+              "filename stem visible in row text. Separate from citymarket_kiryatgat.",
+    ),
+    ChainSpec(
+        code="chp_kt",
+        name_he="משנת יוסף (CHP)",
+        name_en="Mishnat Yosef (CHP)",
+        portal_url="https://chp-kt.pages.dev/",
+        auth_kind="custom",
+        chain_id="5144744100002",
+        notes="Cloudflare Pages shell; file list from Cloudflare Worker JSON API. "
+              "Separate from ktshivuk.binaprojects.com (same legal entity).",
+    ),
+    ChainSpec(
         code="wolt",
         name_he="וולט מרקט",
         name_en="Wolt Market",
