@@ -18,6 +18,7 @@ class ChainSpec:
     name_en: str
     portal_url: str
     auth_kind: AuthKind
+    chain_id: str | None = None         # 13-digit GS1 chain prefix, matches filenames
     username: str | None = None
     password: str | None = None
     notes: str = ""
@@ -30,6 +31,7 @@ CHAINS: list[ChainSpec] = [
         name_en="Shufersal",
         portal_url="https://prices.shufersal.co.il/",
         auth_kind="none",
+        chain_id="7290027600007",
     ),
     ChainSpec(
         code="rami_levi",
@@ -37,6 +39,7 @@ CHAINS: list[ChainSpec] = [
         name_en="Rami Levi",
         portal_url="https://url.publishedprices.co.il/",
         auth_kind="publishedprices",
+        chain_id="7290058140886",
         username="RamiLevi",
         password="",
     ),
@@ -46,9 +49,8 @@ CHAINS: list[ChainSpec] = [
         name_en="Victory",
         portal_url="https://laibcatalog.co.il/",
         auth_kind="laibcatalog",
-        username="victory",
-        password="",
-        notes="Laibcatalog hosts Victory, Machsanei HaShook etc. Store/chain picker on login.",
+        chain_id="7290696200003",
+        notes="Laibcatalog landing HTML embeds direct .xml.gz links per chain_id.",
     ),
     ChainSpec(
         code="yohananof",
@@ -56,6 +58,7 @@ CHAINS: list[ChainSpec] = [
         name_en="Yohananof",
         portal_url="https://url.publishedprices.co.il/",
         auth_kind="publishedprices",
+        chain_id="7290803800003",
         username="yohananof",
         password="",
     ),
@@ -65,6 +68,7 @@ CHAINS: list[ChainSpec] = [
         name_en="Tiv Taam",
         portal_url="https://url.publishedprices.co.il/",
         auth_kind="publishedprices",
+        chain_id="7290873900009",
         username="TivTaam",
         password="",
     ),
