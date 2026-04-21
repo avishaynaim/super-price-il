@@ -31,6 +31,14 @@ from ..scraper.chains.laibcatalog import (
     LaibcatalogScraper,
     make_client_for_laibcatalog,
 )
+from ..scraper.chains.binaprojects import (
+    BinaprojectsScraper,
+    make_client_for_binaprojects,
+)
+from ..scraper.chains.custom import (
+    MegaScraper, make_client_for_mega,
+    HaziHinamScraper, make_client_for_hazi_hinam,
+)
 from ..scraper.registry import BY_CODE
 
 app = typer.Typer(help="Backfill price data into prices.db")
@@ -42,10 +50,15 @@ SCRAPERS = {
     "yohananof":  PublishedPricesScraper,
     "tiv_taam":   PublishedPricesScraper,
     "victory":    LaibcatalogScraper,
+    "king_store": BinaprojectsScraper,
+    "osher_ad":   BinaprojectsScraper,  # subdomain currently NXDOMAIN — disabled in registry
+    "mega":       MegaScraper,
+    "hazi_hinam": HaziHinamScraper,
 }
 
 # Chains whose HTTPS cert chain doesn't validate on this proot env.
-NEEDS_INSECURE = {"rami_levi", "yohananof", "tiv_taam", "victory"}
+NEEDS_INSECURE = {"rami_levi", "yohananof", "tiv_taam", "victory",
+                  "king_store", "osher_ad", "mega", "hazi_hinam"}
 
 
 async def run_chain(
@@ -62,6 +75,12 @@ async def run_chain(
 
     if code == "victory":
         client_cm = make_client_for_laibcatalog()
+    elif code in {"king_store", "osher_ad"}:
+        client_cm = make_client_for_binaprojects()
+    elif code == "mega":
+        client_cm = make_client_for_mega()
+    elif code == "hazi_hinam":
+        client_cm = make_client_for_hazi_hinam()
     elif code in NEEDS_INSECURE:
         client_cm = make_client_for_publishedprices()
     else:
