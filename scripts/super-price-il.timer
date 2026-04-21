@@ -1,0 +1,13 @@
+[Unit]
+Description=super-price-il daily price ingest (run once/day)
+
+[Timer]
+# 04:15 local time: after most chains have posted the overnight update (~03:00)
+# but before the morning web traffic starts.
+OnCalendar=*-*-* 04:15:00
+# If the host was offline at the scheduled time, run as soon as it comes back.
+Persistent=true
+Unit=super-price-il.service
+
+[Install]
+WantedBy=timers.target
