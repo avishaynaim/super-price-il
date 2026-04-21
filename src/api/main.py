@@ -98,6 +98,7 @@ class SearchHit(BaseModel):
     min_price: float
     max_price: float
     chains_with_price: int
+    has_promo: int = 0
 
 
 class TrendPoint(BaseModel):
@@ -178,7 +179,8 @@ def search(
         SELECT p.barcode, p.name, p.manufacturer,
                MIN(cp.price) AS min_price,
                MAX(cp.price) AS max_price,
-               COUNT(DISTINCT ch.id) AS chains_with_price
+               COUNT(DISTINCT ch.id) AS chains_with_price,
+               EXISTS(SELECT 1 FROM promotion_items pi WHERE pi.product_id = p.id) AS has_promo
           FROM products p
           JOIN current_prices cp ON cp.product_id = p.id
           JOIN stores s          ON s.id = cp.store_id
@@ -246,6 +248,32 @@ def trends(barcode: str, days: int = Query(7, ge=1, le=90)):
             (barcode, f"-{days} days"),
         ).fetchall()
     return [TrendPoint(**dict(r)) for r in rows]
+
+
+@app.get("/api/promotions/{barcode}")
+def promotions(barcode: str, chain: str | None = None):
+    """Active promotions touching a given barcode (chain-filterable)."""
+    sql = """
+        SELECT pr.id, ch.code AS chain_code, ch.name_he AS chain_name_he,
+               pr.promo_code, pr.description,
+               pr.starts_at, pr.ends_at,
+               pr.reward_type, pr.min_qty,
+               pr.discount_price, pr.discount_rate,
+               pr.fetched_at
+          FROM promotion_items pi
+          JOIN promotions pr ON pr.id = pi.promotion_id
+          JOIN products  p  ON p.id  = pi.product_id
+          JOIN chains    ch ON ch.id = pr.chain_id
+         WHERE p.barcode = ?
+    """
+    params: list = [barcode]
+    if chain:
+        sql += " AND ch.code = ?"
+        params.append(chain)
+    sql += " ORDER BY pr.starts_at DESC"
+    with db() as c:
+        rows = c.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
 
 
 @app.get("/api/compare/{barcode}")
