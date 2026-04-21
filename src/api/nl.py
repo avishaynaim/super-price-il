@@ -17,6 +17,7 @@ Set ANTHROPIC_API_KEY in env. Model fallback lives in MODEL below.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -80,10 +81,21 @@ class NLRequest(BaseModel):
     query: str
 
 
+class AIUsage(BaseModel):
+    model: str
+    latency_ms: int
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    stop_reason: str | None = None
+
+
 class NLResponse(BaseModel):
     tool_call: dict[str, Any]
     rows: list[dict[str, Any]]
     explanation: str | None = None
+    ai: AIUsage | None = None
 
 
 def _run_tool(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -150,6 +162,7 @@ def nl_filter(req: NLRequest) -> NLResponse:
     from anthropic import Anthropic
     client = Anthropic(api_key=api_key)
 
+    t0 = time.perf_counter()
     resp = client.messages.create(
         model=MODEL,
         max_tokens=1024,
@@ -159,6 +172,7 @@ def nl_filter(req: NLRequest) -> NLResponse:
         tool_choice={"type": "tool", "name": "query_products"},
         messages=[{"role": "user", "content": req.query}],
     )
+    latency_ms = int((time.perf_counter() - t0) * 1000)
 
     tool_block = next((b for b in resp.content if b.type == "tool_use"), None)
     if not tool_block:
@@ -167,8 +181,21 @@ def nl_filter(req: NLRequest) -> NLResponse:
     args = tool_block.input or {}
     rows = _run_tool(args)
     text_blocks = [b.text for b in resp.content if b.type == "text"]
+
+    u = getattr(resp, "usage", None)
+    ai = AIUsage(
+        model=MODEL,
+        latency_ms=latency_ms,
+        input_tokens=getattr(u, "input_tokens", None),
+        output_tokens=getattr(u, "output_tokens", None),
+        cache_read_input_tokens=getattr(u, "cache_read_input_tokens", None),
+        cache_creation_input_tokens=getattr(u, "cache_creation_input_tokens", None),
+        stop_reason=getattr(resp, "stop_reason", None),
+    )
+
     return NLResponse(
         tool_call={"name": tool_block.name, "input": args},
         rows=rows,
         explanation="\n".join(text_blocks) or None,
+        ai=ai,
     )
