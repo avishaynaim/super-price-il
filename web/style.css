@@ -1,0 +1,74 @@
+:root {
+  --bg: #0b1020;
+  --panel: #141a30;
+  --panel-2: #1c2340;
+  --line: #2a3255;
+  --text: #e8ecf7;
+  --muted: #9aa3c7;
+  --accent: #7bd389;
+  --accent-2: #5aa6ff;
+  --warn: #f2c14e;
+  --err: #ef6f6c;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", "Heebo", Arial, sans-serif; }
+header { padding: 22px 26px 10px; border-bottom: 1px solid var(--line); }
+header h1 { margin: 0; font-size: 22px; letter-spacing: .2px; }
+header .tag { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+.health { margin-top: 8px; font-size: 12px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+.tabs { display: flex; gap: 2px; padding: 0 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.tab { background: transparent; color: var(--muted); border: 0; padding: 12px 14px; cursor: pointer; font-size: 14px; }
+.tab.active { color: var(--text); border-bottom: 2px solid var(--accent-2); }
+
+.pane { display: none; padding: 18px 26px; }
+.pane.active { display: block; }
+form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+input, select, button {
+  background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  padding: 9px 12px; border-radius: 6px; font-size: 14px;
+}
+input { min-width: 200px; }
+button { cursor: pointer; background: var(--accent-2); border-color: var(--accent-2); color: #081020; font-weight: 600; }
+button:hover { filter: brightness(1.05); }
+
+.results { display: grid; gap: 8px; }
+.row {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 14px; display: grid; grid-template-columns: 1fr 120px 120px 70px 110px;
+  gap: 10px; align-items: center; font-size: 14px; cursor: pointer;
+}
+.row:hover { border-color: var(--accent-2); }
+.row .nm { font-weight: 600; }
+.row .mf { color: var(--muted); font-size: 12px; }
+.row .bc { color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; }
+.row .price { font-variant-numeric: tabular-nums; }
+.price.min { color: var(--accent); font-weight: 700; }
+.price.max { color: var(--warn); }
+.row .chains { color: var(--muted); text-align: center; }
+.row .btn { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+
+.nl-tool { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted);
+  background: var(--panel-2); padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; direction: ltr; }
+.nl-explain { color: var(--text); margin-bottom: 10px; }
+
+.modal { position: fixed; inset: 0; background: rgba(4,6,14,.72); display: flex; align-items: center; justify-content: center; z-index: 50; }
+.modal.hidden { display: none; }
+.modal-body { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px; width: min(760px, 92%); max-height: 82vh; overflow: auto; position: relative; }
+.modal .close { position: absolute; top: 10px; inset-inline-start: 10px; background: transparent; border: 0; color: var(--muted); font-size: 18px; padding: 4px 8px; cursor: pointer; }
+.modal h2 { margin: 0 0 10px; font-size: 18px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: start; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num { font-variant-numeric: tabular-nums; }
+.cheapest { color: var(--accent); font-weight: 700; }
+
+.spark { display: inline-block; height: 28px; width: 180px; vertical-align: middle; }
+.spark polyline { fill: none; stroke: var(--accent-2); stroke-width: 1.6; }
+.spark circle { fill: var(--accent); }
+
+.empty { color: var(--muted); padding: 14px; text-align: center; border: 1px dashed var(--line); border-radius: 8px; }
+.loading { color: var(--muted); padding: 12px; text-align: center; }
+.err { color: var(--err); padding: 10px; font-size: 13px; }
