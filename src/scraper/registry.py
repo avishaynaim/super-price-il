@@ -78,6 +78,7 @@ CHAINS: list[ChainSpec] = [
         name_en="Osher Ad",
         portal_url="https://osherad.binaprojects.com/",
         auth_kind="binaprojects",
+        notes="DISABLED 2026-04-21: subdomain NXDOMAIN on public DNS; may have moved hosts. Revisit.",
     ),
     ChainSpec(
         code="king_store",
@@ -89,10 +90,11 @@ CHAINS: list[ChainSpec] = [
     ChainSpec(
         code="mega",
         name_he="מגה",
-        name_en="Mega",
-        portal_url="https://publishprice.mega.co.il/",
+        name_en="Mega / Carrefour",
+        portal_url="https://prices.carrefour.co.il/",
         auth_kind="custom",
-        notes="Directory listing, static pattern.",
+        notes="Rebranded Carrefour. publishprice.mega.co.il 301s here. "
+              "Inline `const path`/`const files` on landing page; files at /<path>/<name>.",
     ),
     ChainSpec(
         code="keshet",
@@ -100,6 +102,7 @@ CHAINS: list[ChainSpec] = [
         name_en="Keshet",
         portal_url="https://publishprice.mehadrin.co.il/",
         auth_kind="custom",
+        notes="DISABLED 2026-04-21: subdomain NXDOMAIN; keshet-teamim.co.il also times out. Revisit.",
     ),
     ChainSpec(
         code="hazi_hinam",
