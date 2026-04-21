@@ -3,80 +3,111 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="theme-color" content="#0b1020"/>
+<meta name="description" content="מחירי סופרמרקטים בישראל — כל הרשתות במקום אחד"/>
 <title>super-price-il · מודיעין מחירים</title>
 <link rel="stylesheet" href="/style.css"/>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.min.css"/>
+<script defer src="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.iife.min.js"></script>
 </head>
 <body>
-<header>
+<a class="skip-link" href="#main">דלג לתוכן הראשי</a>
+
+<header role="banner">
   <h1>super-price-il</h1>
   <p class="tag">מחירי סופרמרקטים בישראל — כל הרשתות במקום אחד</p>
-  <div class="health" id="health">טוען…</div>
+  <div class="health" id="health" aria-live="polite">טוען…</div>
+  <div class="offline-banner" id="offline" hidden>אין חיבור לאינטרנט — מוצגים נתונים אחרונים</div>
 </header>
 
-<nav class="tabs">
-  <button class="tab active" data-tab="search">חיפוש</button>
-  <button class="tab"        data-tab="nl">חיפוש חכם (AI)</button>
-  <button class="tab"        data-tab="trends">גרף מחיר</button>
-  <button class="tab"        data-tab="receipt">קבלה</button>
+<nav class="tabs" role="tablist" aria-label="מצבי חיפוש">
+  <button class="tab active" role="tab" data-tab="search"  aria-selected="true"  aria-controls="pane-search">חיפוש</button>
+  <button class="tab"        role="tab" data-tab="nl"      aria-selected="false" aria-controls="pane-nl">חיפוש חכם (AI)</button>
+  <button class="tab"        role="tab" data-tab="trends"  aria-selected="false" aria-controls="pane-trends">גרף מחיר</button>
+  <button class="tab"        role="tab" data-tab="receipt" aria-selected="false" aria-controls="pane-receipt">קבלה</button>
 </nav>
 
+<main id="main">
+
 <!-- search tab -->
-<section class="pane active" id="pane-search">
-  <form id="form-search">
-    <input name="q" placeholder="שם מוצר או ברקוד…" autocomplete="off"/>
-    <select name="chain">
+<section class="pane active" id="pane-search" role="tabpanel" aria-labelledby="tab-search">
+  <form id="form-search" role="search" aria-label="חיפוש מוצרים">
+    <input name="q" placeholder="שם מוצר או ברקוד…" autocomplete="off" aria-label="שאילתת חיפוש" aria-describedby="search-hint"/>
+    <select name="chain" aria-label="רשת">
       <option value="">כל הרשתות</option>
     </select>
-    <input name="city" placeholder="עיר (חלקית)"/>
+    <input name="city" placeholder="עיר (חלקית)" aria-label="עיר"/>
     <button type="submit">חפש</button>
   </form>
-  <div class="results" id="results-search"></div>
+  <div id="search-hint" class="hint">הקלד חיפוש; תוצאות מתעדכנות תוך כדי. חצים ↑↓ לניווט, Enter לפתיחה.</div>
+  <div class="results" id="results-search" role="listbox" tabindex="-1" aria-label="תוצאות חיפוש"></div>
 </section>
 
 <!-- NL -->
-<section class="pane" id="pane-nl">
-  <form id="form-nl">
-    <input name="query" placeholder="למשל: איפה הכי זול קפה עלית 200 גרם" style="flex:1"/>
+<section class="pane" id="pane-nl" role="tabpanel" aria-labelledby="tab-nl" hidden>
+  <form id="form-nl" role="search" aria-label="חיפוש חכם">
+    <input name="query" placeholder="למשל: איפה הכי זול קפה עלית 200 גרם" style="flex:1" aria-label="שאלה בשפה חופשית"/>
     <button type="submit">שאל</button>
   </form>
-  <div class="nl-explain" id="nl-explain"></div>
+  <div class="nl-explain" id="nl-explain" aria-live="polite"></div>
   <div class="nl-tool"    id="nl-tool"></div>
+  <div class="ai-panel"   id="nl-ai" hidden></div>
   <div class="results"    id="results-nl"></div>
 </section>
 
 <!-- trends -->
-<section class="pane" id="pane-trends">
+<section class="pane" id="pane-trends" role="tabpanel" aria-labelledby="tab-trends" hidden>
   <form id="form-trends">
-    <input name="barcode" placeholder="ברקוד (13 ספרות)"/>
-    <select name="days">
+    <input name="barcode" placeholder="ברקוד (13 ספרות)" aria-label="ברקוד" inputmode="numeric" pattern="\d*"/>
+    <select name="days" aria-label="טווח זמן">
       <option value="7">7 ימים</option>
       <option value="14">14 ימים</option>
-      <option value="30">30 ימים</option>
+      <option value="30" selected>30 ימים</option>
+      <option value="90">90 ימים</option>
     </select>
     <button type="submit">הצג</button>
   </form>
+  <div id="trend-chart" class="chart-wrap" aria-label="גרף מחיר"></div>
   <div id="trend-table"></div>
 </section>
 
 <!-- receipt -->
-<section class="pane" id="pane-receipt">
+<section class="pane" id="pane-receipt" role="tabpanel" aria-labelledby="tab-receipt" hidden>
   <form id="form-receipt" enctype="multipart/form-data">
-    <input type="file" name="file" accept="image/*,application/pdf"/>
-    <input name="city" placeholder="העיר שלך (לחיפוש חלופות)"/>
+    <label class="dropzone" id="dropzone" tabindex="0" aria-label="גרור לכאן קובץ קבלה או לחץ לבחירה">
+      <input type="file" name="file" id="receipt-file" accept="image/*,application/pdf" hidden/>
+      <div class="dz-inner">
+        <div class="dz-icon" aria-hidden="true">⬆</div>
+        <div class="dz-main">גרור קובץ לכאן או לחץ לבחירה</div>
+        <div class="dz-sub">PDF או תמונה (JPG/PNG/HEIC)</div>
+        <div class="dz-preview" id="dz-preview" hidden></div>
+      </div>
+    </label>
+    <input name="city" placeholder="העיר שלך (לחיפוש חלופות)" aria-label="עיר"/>
     <button type="submit">העלה וחשב חיסכון</button>
   </form>
+  <div class="progress" id="receipt-progress" hidden>
+    <div class="bar"><div class="fill" id="receipt-bar"></div></div>
+    <div class="progress-label" id="receipt-progress-label">מעלה…</div>
+  </div>
+  <div class="ai-panel" id="receipt-ai" hidden></div>
   <div id="receipt-result"></div>
 </section>
 
-<!-- modal for product detail (compare across chains) -->
-<div class="modal hidden" id="modal">
-  <div class="modal-body">
-    <button class="close" onclick="closeModal()">✕</button>
+</main>
+
+<!-- modal -->
+<div class="modal hidden" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" hidden>
+  <div class="modal-body" role="document">
+    <button class="close" id="modal-close" aria-label="סגור">✕</button>
     <h2 id="modal-title">—</h2>
     <div id="modal-content"></div>
   </div>
 </div>
 
-<script src="/app.js"></script>
+<!-- toast container -->
+<div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false"></div>
+
+<script type="module" src="/js/main.js"></script>
 </body>
 </html>
