@@ -28,7 +28,8 @@ import io
 import json
 import os
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -80,6 +81,7 @@ class Extracted:
     total_paid: float | None
     chain_guess: str | None
     city: str | None
+    ai: dict[str, Any] | None = field(default=None)
 
 
 # ---------------- extraction ----------------
@@ -107,7 +109,7 @@ def _parse_json_envelope(text: str) -> dict[str, Any]:
     return json.loads(payload)
 
 
-def _to_extracted(obj: dict[str, Any]) -> Extracted:
+def _to_extracted(obj: dict[str, Any], ai: dict[str, Any] | None = None) -> Extracted:
     items = []
     for it in obj.get("items") or []:
         try:
@@ -125,7 +127,21 @@ def _to_extracted(obj: dict[str, Any]) -> Extracted:
         total_paid=(float(obj["total_paid"]) if obj.get("total_paid") is not None else None),
         chain_guess=obj.get("chain_guess"),
         city=obj.get("city"),
+        ai=ai,
     )
+
+
+def _usage_dict(resp, model: str, latency_ms: int) -> dict[str, Any]:
+    u = getattr(resp, "usage", None)
+    return {
+        "model": model,
+        "latency_ms": latency_ms,
+        "input_tokens": getattr(u, "input_tokens", None),
+        "output_tokens": getattr(u, "output_tokens", None),
+        "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", None),
+        "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", None),
+        "stop_reason": getattr(resp, "stop_reason", None),
+    }
 
 
 def _anthropic():
@@ -138,6 +154,7 @@ def _anthropic():
 
 def _call_claude_on_text(text: str) -> Extracted:
     client = _anthropic()
+    t0 = time.perf_counter()
     resp = client.messages.create(
         model=MODEL,
         max_tokens=4096,
@@ -146,8 +163,9 @@ def _call_claude_on_text(text: str) -> Extracted:
             {"type": "text", "text": "Extract items from this receipt text:\n\n" + text[:30_000]},
         ]}],
     )
+    latency_ms = int((time.perf_counter() - t0) * 1000)
     body = "".join(b.text for b in resp.content if b.type == "text")
-    return _to_extracted(_parse_json_envelope(body))
+    return _to_extracted(_parse_json_envelope(body), ai=_usage_dict(resp, MODEL, latency_ms))
 
 
 def _call_claude_on_image(data: bytes, media_type: str) -> Extracted:
@@ -171,6 +189,7 @@ def _call_claude_on_image(data: bytes, media_type: str) -> Extracted:
         block = {"type": "image",
                  "source": {"type": "base64", "media_type": media_type, "data": b64}}
 
+    t0 = time.perf_counter()
     resp = client.messages.create(
         model=MODEL,
         max_tokens=4096,
@@ -180,8 +199,9 @@ def _call_claude_on_image(data: bytes, media_type: str) -> Extracted:
             {"type": "text", "text": "Return the JSON object per schema."},
         ]}],
     )
+    latency_ms = int((time.perf_counter() - t0) * 1000)
     body = "".join(b.text for b in resp.content if b.type == "text")
-    return _to_extracted(_parse_json_envelope(body))
+    return _to_extracted(_parse_json_envelope(body), ai=_usage_dict(resp, MODEL, latency_ms))
 
 
 # ---------------- matching ----------------
