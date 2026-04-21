@@ -74,6 +74,7 @@ class BaseChainScraper(abc.ABC):
         since: datetime | None = None,
         concurrency: int = 6,
         limit: int | None = None,
+        kinds: set[str] | None = None,
     ) -> list[DownloadedFile]:
         await self.authenticate()
         sem = asyncio.Semaphore(concurrency)
@@ -84,6 +85,8 @@ class BaseChainScraper(abc.ABC):
 
         tasks: list[asyncio.Task[DownloadedFile]] = []
         async for rf in self.list_files(since=since):
+            if kinds and rf.kind not in kinds:
+                continue
             tasks.append(asyncio.create_task(_fetch(rf)))
             if limit and len(tasks) >= limit:
                 break
