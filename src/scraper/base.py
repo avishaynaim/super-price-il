@@ -3,6 +3,8 @@ from __future__ import annotations
 import abc
 import asyncio
 import gzip
+import io
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +17,19 @@ from .registry import ChainSpec
 RAW_ROOT = Path(__file__).resolve().parents[2] / "data" / "raw"
 
 FileKind = str  # 'PriceFull' | 'Price' | 'PromoFull' | 'Promo' | 'Stores'
+
+
+def _decompress(raw: bytes) -> bytes:
+    """Dispatch by magic bytes. Binaprojects serves ZIPs with .gz extensions;
+    other chains use real gzip. Inner ZIP members may themselves be gzipped."""
+    if raw[:2] == b"\x1f\x8b":
+        return gzip.decompress(raw)
+    if raw[:4] == b"PK\x03\x04":
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            name = z.namelist()[0]
+            inner = z.read(name)
+        return gzip.decompress(inner) if inner[:2] == b"\x1f\x8b" else inner
+    return raw
 
 
 @dataclass
@@ -66,7 +81,7 @@ class BaseChainScraper(abc.ABC):
             path.write_bytes(resp.content)
 
         raw = path.read_bytes()
-        xml = gzip.decompress(raw) if path.suffix == ".gz" or raw[:2] == b"\x1f\x8b" else raw
+        xml = _decompress(raw)
         return DownloadedFile(remote=rf, path=path, xml_bytes=xml)
 
     async def run(
