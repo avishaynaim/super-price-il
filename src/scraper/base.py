@@ -76,9 +76,21 @@ class BaseChainScraper(abc.ABC):
         path = target_dir / rf.filename
 
         if not path.exists():
-            resp = await self.client.get(rf.url)
-            resp.raise_for_status()
-            path.write_bytes(resp.content)
+            # Retry transient network failures with exponential backoff.
+            # Shufersal's CDN and publishedprices both occasionally ReadTimeout
+            # mid-response; one retry recovers most of them.
+            attempts = 3
+            for attempt in range(1, attempts + 1):
+                try:
+                    resp = await self.client.get(rf.url)
+                    resp.raise_for_status()
+                    path.write_bytes(resp.content)
+                    break
+                except (httpx.ReadTimeout, httpx.ConnectTimeout,
+                        httpx.ReadError, httpx.RemoteProtocolError) as e:
+                    if attempt == attempts:
+                        raise
+                    await asyncio.sleep(2 ** attempt)
 
         raw = path.read_bytes()
         xml = _decompress(raw)
@@ -99,7 +111,13 @@ class BaseChainScraper(abc.ABC):
                 return await self.download(rf)
 
         tasks: list[asyncio.Task[DownloadedFile]] = []
-        async for rf in self.list_files(since=since):
+        # list_files accepts `kinds` when the subclass implements pagination-by-kind;
+        # older subclasses ignore the kwarg safely.
+        try:
+            gen = self.list_files(since=since, kinds=kinds)
+        except TypeError:
+            gen = self.list_files(since=since)
+        async for rf in gen:
             if kinds and rf.kind not in kinds:
                 continue
             tasks.append(asyncio.create_task(_fetch(rf)))
