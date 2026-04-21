@@ -41,6 +41,8 @@ from ..scraper.chains.custom import (
     HaziHinamScraper, make_client_for_hazi_hinam,
     SuperPharmScraper, make_client_for_superpharm,
     WoltScraper, make_client_for_wolt,
+    CityMarketScraper, make_client_for_citymarket,
+    ChpKtScraper, make_client_for_chpkt,
 )
 from ..scraper.registry import BY_CODE
 
@@ -71,6 +73,8 @@ SCRAPERS = {
     "hazi_hinam":          HaziHinamScraper,
     "super_pharm":         SuperPharmScraper,
     "wolt":                WoltScraper,
+    "citymarket":          CityMarketScraper,
+    "chp_kt":              ChpKtScraper,
     # All binaprojects chains use the same scraper — only the spec differs:
     "king_store":          BinaprojectsScraper,
     "maayan2000":          BinaprojectsScraper,
@@ -102,7 +106,7 @@ NEEDS_INSECURE = (
     PUBLISHEDPRICES_CODES
     | BINAPROJECTS_CODES
     | {"victory", "machsanei_hashuk", "cohen_h", "mega", "hazi_hinam",
-       "super_pharm", "wolt"}
+       "super_pharm", "wolt", "citymarket", "chp_kt"}
 )
 
 
@@ -130,6 +134,10 @@ async def run_chain(
         client_cm = make_client_for_superpharm()
     elif code == "wolt":
         client_cm = make_client_for_wolt()
+    elif code == "citymarket":
+        client_cm = make_client_for_citymarket()
+    elif code == "chp_kt":
+        client_cm = make_client_for_chpkt()
     elif code in NEEDS_INSECURE:
         client_cm = make_client_for_publishedprices()
     else:
