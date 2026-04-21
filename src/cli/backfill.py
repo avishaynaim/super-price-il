@@ -19,9 +19,10 @@ from ..db.upsert import (
     chain_id_for_code,
     get_or_create_store_by_code,
     insert_observations,
+    insert_promotions,
     upsert_store,
 )
-from ..parser import pricefull, stores as stores_parser
+from ..parser import pricefull, promofull, stores as stores_parser
 from ..scraper.chains.shufersal import ShufersalScraper
 from ..scraper.chains.publishedprices import (
     PublishedPricesScraper,
@@ -51,14 +52,16 @@ SCRAPERS = {
     "tiv_taam":   PublishedPricesScraper,
     "victory":    LaibcatalogScraper,
     "king_store": BinaprojectsScraper,
-    "osher_ad":   BinaprojectsScraper,  # subdomain currently NXDOMAIN — disabled in registry
     "mega":       MegaScraper,
     "hazi_hinam": HaziHinamScraper,
+    # Disabled — portals unreachable from this env as of 2026-04-21:
+    #   osher_ad: osherad.binaprojects.com NXDOMAIN
+    #   keshet:   publishprice.mehadrin.co.il NXDOMAIN
 }
 
 # Chains whose HTTPS cert chain doesn't validate on this proot env.
 NEEDS_INSECURE = {"rami_levi", "yohananof", "tiv_taam", "victory",
-                  "king_store", "osher_ad", "mega", "hazi_hinam"}
+                  "king_store", "mega", "hazi_hinam"}
 
 
 async def run_chain(
@@ -86,7 +89,7 @@ async def run_chain(
     else:
         client_cm = httpx.AsyncClient(
             headers={"User-Agent": "super-price-il/0.1 (research)"},
-            timeout=60,
+            timeout=httpx.Timeout(connect=15, read=120, write=30, pool=30),
             follow_redirects=True,
         )
     async with client_cm as client:
@@ -117,6 +120,14 @@ async def run_chain(
                         continue
                     store_id = get_or_create_store_by_code(conn, chain_id, store_code)
                     rows_written += insert_observations(conn, store_id, rows, str(df.path))
+                elif df.remote.kind in {"PromoFull", "Promo"}:
+                    header, promos = promofull.parse(df.xml_bytes)
+                    store_code = df.remote.store_code or header.store_id
+                    store_id = (
+                        get_or_create_store_by_code(conn, chain_id, store_code)
+                        if store_code else None
+                    )
+                    rows_written += insert_promotions(conn, chain_id, store_id, promos)
                 files_ok += 1
             except Exception as e:
                 console.print(f"[red]{df.remote.filename}: {e}[/red]")
