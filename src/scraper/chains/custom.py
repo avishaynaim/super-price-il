@@ -288,3 +288,113 @@ def make_client_for_wolt() -> httpx.AsyncClient:
         follow_redirects=True,
         verify=False,
     )
+
+
+# -- CityMarket (citymarket-shops.co.il) -------------------------------------
+
+CM_BASE = "https://www.citymarket-shops.co.il"
+CM_ROW = re.compile(
+    r'(?P<fname>(?:PriceFull|PromoFull|Price|Promo|Stores)[0-9A-Za-z\-]+)'
+    r'[\s\S]{1,400}?'
+    r'href="(?P<href>/downloadFile/[a-f0-9\-]+)"',
+    re.M,
+)
+
+
+class CityMarketScraper(BaseChainScraper):
+    """CityMarket portal: server-rendered table with opaque /downloadFile/<uuid>
+    links. The filename appears as plain text in the same row.
+    """
+
+    async def list_files(self, since: datetime | None = None) -> AsyncIterator[RemoteFile]:
+        from datetime import timedelta
+        today = datetime.now(timezone.utc).date()
+        days_back = 1
+        if since:
+            days_back = max(1, (today - since.date()).days + 1)
+        days_back = min(days_back, 3)
+        seen: set[str] = set()
+        for d in range(days_back):
+            day = (today - timedelta(days=d)).isoformat()
+            r = await self.client.get(f"{CM_BASE}/?d={day}")
+            r.raise_for_status()
+            for m in CM_ROW.finditer(r.text):
+                stem = m.group("fname")
+                fname = f"{stem}.xml.gz"
+                if fname in seen:
+                    continue
+                seen.add(fname)
+                published = _cm_published_from_stem(stem)
+                if since and published and published < since:
+                    continue
+                yield RemoteFile(
+                    url=f"{CM_BASE}{m.group('href')}",
+                    filename=fname,
+                    kind=_classify(stem),
+                    store_code=_store_from_filename(stem),
+                    published_at=published,
+                )
+
+
+def _cm_published_from_stem(stem: str) -> datetime | None:
+    # Price7290000000003-013-202604212129 → 2026-04-21 21:29
+    parts = stem.split("-")
+    for p in reversed(parts):
+        if p.isdigit() and len(p) == 12:
+            try:
+                return datetime.strptime(p, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+    return None
+
+
+def make_client_for_citymarket() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        headers={"User-Agent": UA, "Accept-Language": "he-IL,he;q=0.9"},
+        timeout=60,
+        follow_redirects=True,
+        verify=False,
+    )
+
+
+# -- CHP-KT / Mishnat Yosef Cloudflare Pages ---------------------------------
+
+CHPKT_API = "https://list-files.w5871031-kt.workers.dev/"
+
+
+class ChpKtScraper(BaseChainScraper):
+    """Mishnat Yosef (KT) second portal: JSON feed from a Cloudflare Worker."""
+
+    async def list_files(self, since: datetime | None = None) -> AsyncIterator[RemoteFile]:
+        import json as _json
+        r = await self.client.get(CHPKT_API)
+        r.raise_for_status()
+        for row in _json.loads(r.text):
+            name = row.get("name") or ""
+            url = row.get("url") or ""
+            if not url or not name:
+                continue
+            published = None
+            date_s = row.get("date") or ""
+            try:
+                published = datetime.strptime(date_s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+            if since and published and published < since:
+                continue
+            yield RemoteFile(
+                url=url,
+                filename=name,
+                kind=_classify(name),
+                store_code=_store_from_filename(name),
+                published_at=published,
+            )
+
+
+def make_client_for_chpkt() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        headers={"User-Agent": UA},
+        timeout=60,
+        follow_redirects=True,
+        verify=False,
+    )
