@@ -21,7 +21,7 @@ import httpx
 
 from ..base import BaseChainScraper, RemoteFile
 
-BASE = "https://url.publishedprices.co.il"
+DEFAULT_BASE = "https://url.publishedprices.co.il"
 META_CSRF = re.compile(r'<meta name="csrftoken"[^>]*content="([^"]+)"', re.I)
 
 
@@ -49,10 +49,25 @@ def _store_code(filename: str) -> str | None:
 class PublishedPricesScraper(BaseChainScraper):
     _csrf: str = ""
 
+    @property
+    def _base(self) -> str:
+        # Most chains live on url.publishedprices.co.il; Stop Market is on
+        # url.retail.publishedprices.co.il. Derive from spec to support both.
+        url = (self.spec.portal_url or "").rstrip("/")
+        if not url:
+            return DEFAULT_BASE
+        # spec may be .../login — trim off trailing path
+        for suffix in ("/login", "/file"):
+            if url.endswith(suffix):
+                url = url[: -len(suffix)]
+                break
+        return url or DEFAULT_BASE
+
     async def authenticate(self) -> None:
         # httpx verify is set at client construction time; we assume the caller
         # built an AsyncClient with verify=False for this chain.
-        r = await self.client.get(f"{BASE}/login")
+        base = self._base
+        r = await self.client.get(f"{base}/login")
         r.raise_for_status()
         m = META_CSRF.search(r.text)
         if not m:
@@ -60,7 +75,7 @@ class PublishedPricesScraper(BaseChainScraper):
         token = m.group(1)
 
         r2 = await self.client.post(
-            f"{BASE}/login/user",
+            f"{base}/login/user",
             data={
                 "r": "",
                 "username": self.spec.username or "",
@@ -71,49 +86,77 @@ class PublishedPricesScraper(BaseChainScraper):
         )
         r2.raise_for_status()
 
-        r3 = await self.client.get(f"{BASE}/file")
+        r3 = await self.client.get(f"{base}/file")
         r3.raise_for_status()
         m2 = META_CSRF.search(r3.text)
         if not m2:
             raise RuntimeError("publishedprices: no csrftoken after login (auth probably failed)")
         self._csrf = m2.group(1)
 
-    async def list_files(self, since: datetime | None = None) -> AsyncIterator[RemoteFile]:
+    async def _list_dir(self, cd: str) -> list[dict]:
+        base = self._base
         r = await self.client.post(
-            f"{BASE}/file/json/dir",
+            f"{base}/file/json/dir",
             data={
                 "sEcho": "1",
                 "iColumns": "5",
                 "sColumns": "",
                 "iDisplayStart": "0",
                 "iDisplayLength": "100000",
-                "cd": "/",
+                "cd": cd,
                 "csrftoken": self._csrf,
             },
             headers={"X-Requested-With": "XMLHttpRequest"},
         )
         r.raise_for_status()
-        data = r.json()
-        rows = data.get("aaData", [])
-        for row in rows:
-            if row.get("type") != "file":
-                continue
-            fname = row.get("fname") or row.get("name")
-            if not fname or not fname.endswith(".gz"):
-                continue
-            try:
-                published = datetime.fromisoformat(row["time"].replace("Z", "+00:00"))
-            except Exception:
-                published = None
-            if since and published and published < since:
-                continue
-            yield RemoteFile(
-                url=f"{BASE}/file/d/{fname}",
-                filename=fname,
-                kind=_classify(fname),
-                store_code=_store_code(fname),
-                published_at=published,
-            )
+        return r.json().get("aaData", []) or []
+
+    async def list_files(self, since: datetime | None = None) -> AsyncIterator[RemoteFile]:
+        # Most chains put files at the root. Super Yuda (and potentially others)
+        # nest them one level deep in a subfolder (e.g. "/Yuda"). Walk a small
+        # directory tree (max depth 2) to handle both.
+        base = self._base
+        queue = ["/"]
+        seen: set[str] = set()
+        depth = 0
+        while queue and depth <= 2:
+            next_queue: list[str] = []
+            for cd in queue:
+                if cd in seen:
+                    continue
+                seen.add(cd)
+                try:
+                    rows = await self._list_dir(cd)
+                except Exception:
+                    continue
+                for row in rows:
+                    rtype = row.get("type")
+                    name = row.get("fname") or row.get("name") or ""
+                    if rtype == "folder" and name and not name.startswith("."):
+                        sub = (cd.rstrip("/") + "/" + name) if cd != "/" else "/" + name
+                        next_queue.append(sub)
+                        continue
+                    if rtype != "file" or not name.endswith(".gz"):
+                        continue
+                    try:
+                        published = datetime.fromisoformat(row["time"].replace("Z", "+00:00"))
+                    except Exception:
+                        published = None
+                    if since and published and published < since:
+                        continue
+                    # Cerberus serves nested files at /file/d/<subdir>/<name>.
+                    # Strip leading "/" from cd so we don't double-slash.
+                    sub = cd.lstrip("/")
+                    path = f"{sub}/{name}" if sub else name
+                    yield RemoteFile(
+                        url=f"{base}/file/d/{path}",
+                        filename=name,
+                        kind=_classify(name),
+                        store_code=_store_code(name),
+                        published_at=published,
+                    )
+            queue = next_queue
+            depth += 1
 
 
 def make_client_for_publishedprices() -> httpx.AsyncClient:
