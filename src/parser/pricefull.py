@@ -11,7 +11,7 @@ from typing import Iterator
 from lxml import etree
 
 
-ITEM_TAGS = {"Item", "Product"}  # chains disagree
+ITEM_TAGS = {"Item", "Product", "Line"}  # chains disagree (Super-Pharm uses Line)
 
 FIELD_MAP = {
     "ItemCode": "barcode",
