@@ -239,3 +239,52 @@ def make_client_for_superpharm() -> httpx.AsyncClient:
         follow_redirects=True,
         verify=False,
     )
+
+
+# -- Wolt --------------------------------------------------------------------
+
+WOLT_BASE = "https://wm-gateway.wolt.com/isr-prices/public/v1"
+WOLT_DATE_HREF = re.compile(r'href="(\d{4}-\d{2}-\d{2})\.html"')
+WOLT_FILE_HREF = re.compile(r'href="(download/\d{4}-\d{2}-\d{2}/[^"]+\.gz)"')
+
+
+class WoltScraper(BaseChainScraper):
+    """Wolt-Market price portal: plain directory listing per day."""
+
+    async def list_files(self, since: datetime | None = None) -> AsyncIterator[RemoteFile]:
+        # grab the per-day index — each <li> links to a day page
+        r = await self.client.get(f"{WOLT_BASE}/index.html")
+        r.raise_for_status()
+        dates = WOLT_DATE_HREF.findall(r.text)
+        # recent dates first
+        dates.sort(reverse=True)
+        for d in dates:
+            try:
+                day_dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if since and day_dt < since.replace(hour=0, minute=0, second=0, microsecond=0):
+                break
+            rd = await self.client.get(f"{WOLT_BASE}/{d}.html")
+            rd.raise_for_status()
+            for href in WOLT_FILE_HREF.findall(rd.text):
+                fname = href.rsplit("/", 1)[-1]
+                published = _hazi_date_from_filename(fname) or day_dt
+                if since and published and published < since:
+                    continue
+                yield RemoteFile(
+                    url=f"{WOLT_BASE}/{href}",
+                    filename=fname,
+                    kind=_classify(fname),
+                    store_code=_store_from_filename(fname),
+                    published_at=published,
+                )
+
+
+def make_client_for_wolt() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        headers={"User-Agent": UA},
+        timeout=60,
+        follow_redirects=True,
+        verify=False,
+    )
