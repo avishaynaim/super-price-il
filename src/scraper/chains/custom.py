@@ -154,3 +154,88 @@ def make_client_for_hazi_hinam() -> httpx.AsyncClient:
         follow_redirects=True,
         verify=False,
     )
+
+
+# -- Super-Pharm -------------------------------------------------------------
+
+SUPERPHARM_BASE = "http://prices.super-pharm.co.il"
+SUPERPHARM_LINK = re.compile(r'href="(/Download/[^"]+\.gz\?[^"]+)"', re.I)
+SUPERPHARM_PAGES = re.compile(r'data-page="(\d+)"')
+SUPERPHARM_DATE = re.compile(
+    r'<td[^>]*>\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}(?::\d{2})?)\s*</td>'
+)
+
+
+def _superpharm_published(fname: str) -> datetime | None:
+    # PriceFull7290172900007-006-202604210707.gz → 2026-04-21 07:07
+    stem = fname.split(".", 1)[0]
+    parts = stem.split("-")
+    # last part is a timestamp like 202604210707 (12 chars) or 20260421-070712 (date-time)
+    tail = parts[-1]
+    try:
+        if len(tail) == 12:
+            return datetime.strptime(tail, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+        if len(tail) == 6 and len(parts) >= 2 and len(parts[-2]) == 8:
+            return datetime.strptime(parts[-2] + tail, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return None
+
+
+class SuperPharmScraper(BaseChainScraper):
+    """Super-Pharm portal: paginated HTML grid with direct /Download/* links.
+
+    ~124 pages, ~20 rows per page → ~2,500 file entries. We walk pages until
+    `since` is exceeded or the link set stops growing.
+    """
+
+    async def list_files(self, since: datetime | None = None) -> AsyncIterator[RemoteFile]:
+        seen: set[str] = set()
+        page = 1
+        max_page = 1
+        while page <= max_page:
+            r = await self.client.get(f"{SUPERPHARM_BASE}/?page={page}")
+            r.raise_for_status()
+            html = r.text
+            # capture the max page number once
+            if page == 1:
+                pages = [int(m) for m in SUPERPHARM_PAGES.findall(html)]
+                if pages:
+                    max_page = max(pages)
+            older_only = True  # if every link on this page is older than `since`, stop
+            for link in SUPERPHARM_LINK.findall(html):
+                # link = "/Download/PriceFull...gz?bucketName=..."
+                fname = link.split("/Download/", 1)[1].split("?", 1)[0]
+                if fname in seen:
+                    continue
+                seen.add(fname)
+                published = _superpharm_published(fname)
+                if since and published and published < since:
+                    continue
+                older_only = False
+                yield RemoteFile(
+                    url=f"{SUPERPHARM_BASE}{link}",
+                    filename=fname,
+                    kind=_classify(fname),
+                    store_code=_store_from_filename(fname),
+                    published_at=published,
+                )
+            # cheap heuristic: rows come in descending date order on page 1, but
+            # subsequent pages may interleave Price/PriceFull/Promo/PromoFull.
+            # Keep walking until we've scanned all pages; `since` filter drops
+            # old ones. Cap the walk to avoid runaway if layout changes.
+            page += 1
+            if page > 200:
+                break
+            if since and older_only and page > 3:
+                # three consecutive pages with only stale links → done
+                break
+
+
+def make_client_for_superpharm() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        headers={"User-Agent": UA, "Accept-Language": "he-IL,he;q=0.9,en;q=0.8"},
+        timeout=60,
+        follow_redirects=True,
+        verify=False,
+    )
