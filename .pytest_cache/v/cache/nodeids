@@ -1,0 +1,18 @@
+[
+  "tests/test_classify.py::test_laibcatalog_classify",
+  "tests/test_classify.py::test_publishedprices_classify_case_insensitive",
+  "tests/test_classify.py::test_publishedprices_store_code",
+  "tests/test_classify.py::test_shufersal_classify",
+  "tests/test_decompress.py::test_plain_gzip_roundtrip",
+  "tests/test_decompress.py::test_uncompressed_passes_through",
+  "tests/test_decompress.py::test_zip_with_gzipped_inner_member",
+  "tests/test_decompress.py::test_zip_wrapping_binaprojects_case",
+  "tests/test_matcher.py::test_jaccard_intuition",
+  "tests/test_matcher.py::test_tokens_hebrew",
+  "tests/test_matcher.py::test_tokens_lowercases_and_drops_tiny",
+  "tests/test_parsers.py::test_pricefull_parses_basic_rows",
+  "tests/test_parsers.py::test_promofull_parser_extracts_items",
+  "tests/test_parsers.py::test_promofull_parser_victory_flat_itemcode",
+  "tests/test_parsers.py::test_stores_parser_uppercase_shufersal",
+  "tests/test_parsers.py::test_stores_parser_victory_branch_element"
+]
