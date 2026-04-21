@@ -46,22 +46,44 @@ app = typer.Typer(help="Backfill price data into prices.db")
 console = Console()
 
 SCRAPERS = {
-    "shufersal":  ShufersalScraper,
-    "rami_levi":  PublishedPricesScraper,
-    "yohananof":  PublishedPricesScraper,
-    "tiv_taam":   PublishedPricesScraper,
-    "victory":    LaibcatalogScraper,
-    "king_store": BinaprojectsScraper,
-    "mega":       MegaScraper,
-    "hazi_hinam": HaziHinamScraper,
-    # Disabled — portals unreachable from this env as of 2026-04-21:
-    #   osher_ad: osherad.binaprojects.com NXDOMAIN
-    #   keshet:   publishprice.mehadrin.co.il NXDOMAIN
+    "shufersal":           ShufersalScraper,
+    "rami_levi":           PublishedPricesScraper,
+    "yohananof":           PublishedPricesScraper,
+    "tiv_taam":            PublishedPricesScraper,
+    # Re-enabled 2026-04-21 — gov.il confirms they serve via Cerberus:
+    "osher_ad":            PublishedPricesScraper,
+    "keshet":              PublishedPricesScraper,
+    "victory":             LaibcatalogScraper,
+    "mega":                MegaScraper,
+    "hazi_hinam":          HaziHinamScraper,
+    # All binaprojects chains use the same scraper — only the spec differs:
+    "king_store":          BinaprojectsScraper,
+    "maayan2000":          BinaprojectsScraper,
+    "good_pharm":          BinaprojectsScraper,
+    "zolvebegadol":        BinaprojectsScraper,
+    "supersapir":          BinaprojectsScraper,
+    "superbareket":        BinaprojectsScraper,
+    "shuk_hayir":          BinaprojectsScraper,
+    "shefa_berkat_hashem": BinaprojectsScraper,
+    "citymarket_kiryatgat": BinaprojectsScraper,
+    "ktshivuk":            BinaprojectsScraper,
 }
 
 # Chains whose HTTPS cert chain doesn't validate on this proot env.
-NEEDS_INSECURE = {"rami_levi", "yohananof", "tiv_taam", "victory",
-                  "king_store", "mega", "hazi_hinam"}
+NEEDS_INSECURE = {
+    "rami_levi", "yohananof", "tiv_taam", "osher_ad", "keshet",
+    "victory", "mega", "hazi_hinam",
+    "king_store", "maayan2000", "good_pharm", "zolvebegadol",
+    "supersapir", "superbareket", "shuk_hayir", "shefa_berkat_hashem",
+    "citymarket_kiryatgat", "ktshivuk",
+}
+
+# Codes whose portals are on the binaprojects.com platform.
+BINAPROJECTS_CODES = {
+    "king_store", "maayan2000", "good_pharm", "zolvebegadol",
+    "supersapir", "superbareket", "shuk_hayir", "shefa_berkat_hashem",
+    "citymarket_kiryatgat", "ktshivuk",
+}
 
 
 async def run_chain(
@@ -78,7 +100,7 @@ async def run_chain(
 
     if code == "victory":
         client_cm = make_client_for_laibcatalog()
-    elif code in {"king_store", "osher_ad"}:
+    elif code in BINAPROJECTS_CODES:
         client_cm = make_client_for_binaprojects()
     elif code == "mega":
         client_cm = make_client_for_mega()
