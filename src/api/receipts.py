@@ -50,4 +50,5 @@ async def upload_receipt(
         "total_paid": ex.total_paid or sum(m["line_total"] for m in matched),
         "items": matched,
         "alternatives": alternatives,
+        "ai": ex.ai,
     }
