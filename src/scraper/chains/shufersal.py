@@ -67,40 +67,66 @@ class ShufersalScraper(BaseChainScraper):
         resp.raise_for_status()
         return resp.text
 
-    async def list_files(self, since: datetime | None = None) -> AsyncIterator[RemoteFile]:
-        page = 1
+    async def list_files(
+        self,
+        since: datetime | None = None,
+        kinds: set[str] | None = None,
+    ) -> AsyncIterator[RemoteFile]:
+        # catID map: 0=all, 1=Price, 2=PriceFull, 3=Promo, 4=PromoFull, 5=StoreFull.
+        # When we know which kinds are wanted, hit only those categories —
+        # listing the "all" view paginates deep and triggers ReadTimeouts.
+        KIND_TO_CAT = {
+            "Price": 1, "PriceFull": 2, "Promo": 3, "PromoFull": 4,
+            "Stores": 5, "StoresFull": 5,
+        }
+        if kinds:
+            categories = tuple(sorted({KIND_TO_CAT[k] for k in kinds if k in KIND_TO_CAT}))
+            if not categories:
+                categories = (0,)
+        else:
+            categories = (0, 5)
         seen: set[str] = set()
-        while True:
-            html = await self._fetch_page(page)
-            soup = BeautifulSoup(html, "html.parser")
-            rows = soup.find_all("tr")
-            any_new = False
-            for tr in rows:
-                a = tr.find("a", href=True)
-                if not a:
-                    continue
-                href = a["href"]
-                if ".gz" not in href:
-                    continue
-                url = urljoin(BASE, href)
-                path_only = urlparse(url).path
-                filename = path_only.rsplit("/", 1)[-1]   # e.g. Price...-202604201800.gz
-                if filename in seen:
-                    continue
-                seen.add(filename)
-                any_new = True
-                published = _date_from_filename(filename)
-                if since and published and published < since:
-                    continue
-                yield RemoteFile(
-                    url=url,
-                    filename=filename,
-                    kind=_classify(filename),
-                    store_code=_store_code_from_filename(filename),
-                    published_at=published,
-                )
-            if not any_new:
-                break
-            page += 1
-            if page > 200:
-                break  # safety
+        for cat_id in categories:
+            page = 1
+            while True:
+                html = await self._fetch_page(page, cat_id=cat_id)
+                soup = BeautifulSoup(html, "html.parser")
+                rows = soup.find_all("tr")
+                any_new = False
+                page_all_stale = bool(since)  # only applies when since is set
+                page_had_file = False
+                for tr in rows:
+                    a = tr.find("a", href=True)
+                    if not a:
+                        continue
+                    href = a["href"]
+                    if ".gz" not in href:
+                        continue
+                    url = urljoin(BASE, href)
+                    path_only = urlparse(url).path
+                    filename = path_only.rsplit("/", 1)[-1]
+                    if filename in seen:
+                        continue
+                    seen.add(filename)
+                    any_new = True
+                    page_had_file = True
+                    published = _date_from_filename(filename)
+                    if since and published and published < since:
+                        continue
+                    page_all_stale = False
+                    yield RemoteFile(
+                        url=url,
+                        filename=filename,
+                        kind=_classify(filename),
+                        store_code=_store_code_from_filename(filename),
+                        published_at=published,
+                    )
+                if not any_new:
+                    break
+                # Listings are newest-first. Once a full page fell behind `since`,
+                # later pages will too.
+                if since and page_had_file and page_all_stale:
+                    break
+                page += 1
+                if page > 200:
+                    break
