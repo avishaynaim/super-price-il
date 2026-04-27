@@ -23,7 +23,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from ..db.connection import connect
+from ..db.pg import cursor as _pg_cursor
 
 nl_router = APIRouter()
 
@@ -106,8 +106,7 @@ def _run_tool(args: dict[str, Any]) -> list[dict[str, Any]]:
     limit = min(int(args.get("limit") or 50), 200)
     barcode = args.get("barcode")
 
-    conn = connect()
-    try:
+    with _pg_cursor() as cur:
         if mode == "cheapest_per_chain" and barcode:
             sql = """
                 SELECT ch.code AS chain_code, ch.name_he AS chain_name_he,
@@ -117,14 +116,15 @@ def _run_tool(args: dict[str, Any]) -> list[dict[str, Any]]:
                   JOIN products p ON p.id = cp.product_id
                   JOIN stores s   ON s.id = cp.store_id
                   JOIN chains ch  ON ch.id = s.chain_id
-                 WHERE p.barcode = ?
+                 WHERE p.barcode = %s
             """
             params: list = [barcode]
             if city:
-                sql += " AND s.city LIKE ?"; params.append(f"%{city}%")
-            sql += " GROUP BY ch.id ORDER BY min_price ASC LIMIT ?"
+                sql += " AND s.city ILIKE %s"; params.append(f"%{city}%")
+            sql += " GROUP BY ch.id, ch.code, ch.name_he ORDER BY min_price ASC LIMIT %s"
             params.append(limit)
-            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
 
         is_bc = q.isdigit() and len(q) >= 6
         sql = """
@@ -139,18 +139,17 @@ def _run_tool(args: dict[str, Any]) -> list[dict[str, Any]]:
         """
         params = []
         if is_bc:
-            sql += " WHERE p.barcode = ?"; params.append(q)
+            sql += " WHERE p.barcode = %s"; params.append(q)
         else:
-            sql += " WHERE p.name LIKE ?"; params.append(f"%{q}%")
+            sql += " WHERE p.name ILIKE %s"; params.append(f"%{q}%")
         if chain:
-            sql += " AND ch.code = ?"; params.append(chain)
+            sql += " AND ch.code = %s"; params.append(chain)
         if city:
-            sql += " AND s.city LIKE ?"; params.append(f"%{city}%")
-        sql += " GROUP BY p.id ORDER BY chains_with_price DESC, min_price ASC LIMIT ?"
+            sql += " AND s.city ILIKE %s"; params.append(f"%{city}%")
+        sql += " GROUP BY p.id, p.barcode, p.name, p.manufacturer ORDER BY chains_with_price DESC, min_price ASC LIMIT %s"
         params.append(limit)
-        return [dict(r) for r in conn.execute(sql, params).fetchall()]
-    finally:
-        conn.close()
+        cur.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
 
 
 @nl_router.post("/nl-filter", response_model=NLResponse)
