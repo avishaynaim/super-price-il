@@ -128,10 +128,12 @@ CREATE TABLE IF NOT EXISTS scrape_runs (
     chain_id      INTEGER NOT NULL REFERENCES chains(id),
     started_at    TEXT NOT NULL,
     finished_at   TEXT,
-    status        TEXT NOT NULL,                -- 'running','ok','error','partial'
+    status        TEXT NOT NULL,                -- 'running','ok','error','partial','killed'
     files_ok      INTEGER NOT NULL DEFAULT 0,
     files_failed  INTEGER NOT NULL DEFAULT 0,
+    files_total   INTEGER NOT NULL DEFAULT 0,    -- discovered file count for live progress
     rows_written  INTEGER NOT NULL DEFAULT 0,
+    progress_at   TEXT,                          -- last heartbeat (live progress writer)
     error_msg     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_chain_time ON scrape_runs(chain_id, started_at);
