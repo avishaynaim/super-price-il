@@ -8,10 +8,15 @@ import { initModal } from "./product.js";
 import { initSearch, loadChains, onRouted as onSearchRoute } from "./search.js";
 import { initNL,      onRouted as onNLRoute }     from "./nl.js";
 import { initTrends,  onRouted as onTrendsRoute } from "./trends.js";
+import { initDashboard, onRouted as onDashRoute } from "./dashboard.js";
 import { initReceipt } from "./receipt.js";
+import { initLive } from "./live.js";
+import { initScrapeStatus } from "./scrape.js";
+import { initSettings } from "./settings.js";
+import { getPrefs, onPrefsChange, setPrefs } from "./prefs.js";
 
 // ---- tabs ----
-const TABS = ["search", "nl", "trends", "receipt"];
+const TABS = ["search", "nl", "trends", "dashboard", "receipt", "live", "scrape"];
 function activateTab(id) {
   for (const t of TABS) {
     const btn  = document.querySelector(`.tab[data-tab="${t}"]`);
@@ -81,13 +86,44 @@ initModal();
 initSearch();
 initNL();
 initTrends();
+initDashboard();
 initReceipt();
+initLive();
+initScrapeStatus();
+initSettings();
+
+// Render a compact pref strip under the health line so saved location/radius
+// are always visible, and refresh it whenever prefs change.
+function renderPrefStrip() {
+  const strip = document.getElementById("pref-strip");
+  if (!strip) return;
+  const p = getPrefs();
+  const bits = [];
+  if (p.city) bits.push(`עיר: <b>${escapeHtml(p.city)}</b>`);
+  if (p.coords && p.radius_km > 0) bits.push(`טווח: <b>${p.radius_km} ק"מ</b>`);
+  if (p.preferred_chains.length) bits.push(`רשתות: <b>${p.preferred_chains.length}</b>`);
+  if (!bits.length) { strip.hidden = true; strip.innerHTML = ""; return; }
+  strip.hidden = false;
+  strip.innerHTML = bits.join(" · ") +
+    ' · <button class="pref-clear-inline" id="pref-strip-clear">נקה</button>';
+  document.getElementById("pref-strip-clear")?.addEventListener("click", () => setPrefs({
+    city: null, coords: null, radius_km: 0, preferred_chains: []
+  }));
+}
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+}
+onPrefsChange(renderPrefStrip);
+renderPrefStrip();
 
 onRoute(state => {
   activateTab(state.tab);
   onSearchRoute(state);
   onNLRoute(state);
   onTrendsRoute(state);
+  onDashRoute(state);
 });
 
 bootstrap();
