@@ -18,7 +18,13 @@ receipts_router = APIRouter()
 async def upload_receipt(
     file: UploadFile = File(...),
     city: str | None = Form(None),
+    provider: str | None = Form(None),
 ) -> dict:
+    """Upload a receipt photo or PDF.
+
+    `provider` selects the OCR backend (overrides OCR_PROVIDER env):
+      claude (default) | rapid | ocrspace | auto
+    """
     data = await file.read()
     if not data:
         raise HTTPException(400, "empty file")
@@ -32,7 +38,11 @@ async def upload_receipt(
             (".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic")
         ):
             source = "photo"
-            ex = extract_from_image(data, ct if ct.startswith("image/") else "image/png")
+            ex = extract_from_image(
+                data,
+                ct if ct.startswith("image/") else "image/png",
+                provider=provider,
+            )
         else:
             raise HTTPException(415, f"unsupported content-type: {ct}")
     except RuntimeError as e:
