@@ -71,7 +71,10 @@ class MegaScraper(BaseChainScraper):
 
         for f in files:
             fname = f.get("name")
-            if not fname or not fname.endswith(".gz"):
+            # Carrefour serves PriceFull/Price/PromoFull/Promo as .gz but the
+            # one daily Stores file is plain .xml. Accept both — base._decompress
+            # dispatches by magic bytes anyway.
+            if not fname or not fname.endswith((".gz", ".xml")):
                 continue
             published = None
             try:
