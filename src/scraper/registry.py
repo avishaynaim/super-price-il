@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-AuthKind = Literal["none", "publishedprices", "binaprojects", "laibcatalog", "custom"]
+AuthKind = Literal["none", "publishedprices", "binaprojects", "laibcatalog", "laibcatalog_v2", "custom"]
 
 
 @dataclass(frozen=True)
@@ -47,19 +47,22 @@ CHAINS: list[ChainSpec] = [
         code="victory",
         name_he="ויקטורי",
         name_en="Victory",
-        portal_url="https://laibcatalog.co.il/",
-        auth_kind="laibcatalog",
+        portal_url="https://laibcatalog.co.il/victory/index.html",
+        auth_kind="laibcatalog_v2",
         chain_id="7290696200003",
-        notes="Laibcatalog landing HTML embeds direct .xml.gz links per chain_id.",
+        notes="Migrated 2026-04-27 from legacy laibcatalog HTML scraping to "
+              "the new JSON API at /webapi/api/getfiles?edi=<chain_id>. "
+              "Old landing dropped direct file links mid-2026.",
     ),
     ChainSpec(
         code="machsanei_hashuk",
         name_he="מחסני השוק",
         name_en="Machsanei Hashuk",
-        portal_url="https://laibcatalog.co.il/",
-        auth_kind="laibcatalog",
+        portal_url="https://laibcatalog.co.il/mshuk/index.html",
+        auth_kind="laibcatalog_v2",
         chain_id="7290661400001",
-        notes="Legal entity: כ.נ מחסני השוק בע\"מ. Shares laibcatalog.co.il with Victory.",
+        notes="Legal entity: כ.נ מחסני השוק בע\"מ. Migrated 2026-04-27 to "
+              "v2 JSON API — was 0 prices on the legacy scraper.",
     ),
     ChainSpec(
         code="cohen_h",
@@ -186,6 +189,38 @@ CHAINS: list[ChainSpec] = [
         name_en="Shefa Berkat Hashem",
         portal_url="http://shefabirkathashem.binaprojects.com/",
         auth_kind="binaprojects",
+    ),
+    # --- newly discovered 2026-04-27 from gov.il audit ---
+    # Netiv Hahesed (סופר חסד / ברכל) — entirely missing legal entity from
+    # the gov.il list. Has its own portal at an IP-only URL with an ASP.NET
+    # WebForms search interface (__VIEWSTATE / __EVENTVALIDATION POST flow).
+    # No scraper module yet; registered as active=False until one is written
+    # so the dashboard's "סטטוס סריקה" doesn't permanently flag it as 'dead'.
+    ChainSpec(
+        code="netiv_hahesed",
+        name_he="נתיב החסד",
+        name_en="Netiv Hahesed (סופר חסד / ברכל)",
+        portal_url="http://141.226.203.152/",
+        auth_kind="custom",
+        chain_id="7290058160839",
+        notes="Legal entity: נתיב החסד - סופר חסד בע\"מ. Plain IIS directory "
+              "listing — no auth, no JS, just <A HREF=...gz> links. "
+              "Sub-brands: סופר חסד, ברכל.",
+    ),
+    # Carrefour Quik — the *third* sub-brand under Global Retail (the same
+    # legal entity as Mega/Carrefour) but on a separate portal at
+    # prices.quik.co.il. Same MegaScraper format presumed; DNS doesn't
+    # resolve from this proot host so registered but inactive until
+    # network reach is confirmed.
+    ChainSpec(
+        code="quik",
+        name_he="קוויק",
+        name_en="Quik (Carrefour group)",
+        portal_url="https://prices.quik.co.il/",
+        auth_kind="custom",
+        notes="Same legal entity as code='mega' (גלובל ריטייל). Separate "
+              "convenience-store portal. DNS unreachable in current env — "
+              "scraper hookup pending.",
     ),
     ChainSpec(
         code="citymarket_kiryatgat",
