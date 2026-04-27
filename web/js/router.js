@@ -1,7 +1,7 @@
 // Hash router: #search, #nl, #trends?bc=7290..., #receipt
 // Separates the tab id from per-tab query params — tabs can save/restore state.
 
-const VALID = new Set(["search", "nl", "trends", "receipt"]);
+const VALID = new Set(["search", "nl", "trends", "dashboard", "receipt", "live", "scrape"]);
 
 function parse() {
   const h = location.hash.replace(/^#/, "");
