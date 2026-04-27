@@ -14,17 +14,26 @@
 <a class="skip-link" href="#main">דלג לתוכן הראשי</a>
 
 <header role="banner">
-  <h1>super-price-il</h1>
-  <p class="tag">מחירי סופרמרקטים בישראל — כל הרשתות במקום אחד</p>
+  <div class="header-row">
+    <div>
+      <h1>super-price-il</h1>
+      <p class="tag">מחירי סופרמרקטים בישראל — כל הרשתות במקום אחד</p>
+    </div>
+    <button class="icon-btn" id="btn-settings" type="button" aria-label="הגדרות ומיקום" title="הגדרות">⚙</button>
+  </div>
   <div class="health" id="health" aria-live="polite">טוען…</div>
+  <div class="pref-strip" id="pref-strip" hidden></div>
   <div class="offline-banner" id="offline" hidden>אין חיבור לאינטרנט — מוצגים נתונים אחרונים</div>
 </header>
 
 <nav class="tabs" role="tablist" aria-label="מצבי חיפוש">
-  <button class="tab active" role="tab" data-tab="search"  aria-selected="true"  aria-controls="pane-search">חיפוש</button>
-  <button class="tab"        role="tab" data-tab="nl"      aria-selected="false" aria-controls="pane-nl">חיפוש חכם (AI)</button>
-  <button class="tab"        role="tab" data-tab="trends"  aria-selected="false" aria-controls="pane-trends">גרף מחיר</button>
-  <button class="tab"        role="tab" data-tab="receipt" aria-selected="false" aria-controls="pane-receipt">קבלה</button>
+  <button class="tab active" role="tab" data-tab="search"    aria-selected="true"  aria-controls="pane-search">חיפוש</button>
+  <button class="tab"        role="tab" data-tab="nl"        aria-selected="false" aria-controls="pane-nl">חיפוש חכם (AI)</button>
+  <button class="tab"        role="tab" data-tab="trends"    aria-selected="false" aria-controls="pane-trends">גרף מחיר</button>
+  <button class="tab"        role="tab" data-tab="dashboard" aria-selected="false" aria-controls="pane-dashboard">לוח בקרה</button>
+  <button class="tab"        role="tab" data-tab="receipt"   aria-selected="false" aria-controls="pane-receipt">קבלה</button>
+  <button class="tab"        role="tab" data-tab="live"      aria-selected="false" aria-controls="pane-live">סריקה חיה</button>
+  <button class="tab"        role="tab" data-tab="scrape"    aria-selected="false" aria-controls="pane-scrape">סטטוס סריקה</button>
 </nav>
 
 <main id="main">
@@ -49,6 +58,14 @@
     <input name="query" placeholder="למשל: איפה הכי זול קפה עלית 200 גרם" style="flex:1" aria-label="שאלה בשפה חופשית"/>
     <button type="submit">שאל</button>
   </form>
+  <div class="nl-presets" id="nl-presets" aria-label="דוגמאות מהירות">
+    <span class="hint">דוגמאות:</span>
+    <button type="button" class="nl-chip" data-q="איפה הכי זול חלב תנובה 3% 1 ליטר">חלב הכי זול</button>
+    <button type="button" class="nl-chip" data-q="לחם אחיד עד 6 שקלים">לחם עד ₪6</button>
+    <button type="button" class="nl-chip" data-q="במבה אסם 80 גרם — באיזו רשת זול ביותר">במבה — איפה זול</button>
+    <button type="button" class="nl-chip" data-q="קוטג' תנובה 5% במבצע">קוטג׳ במבצע</button>
+    <button type="button" class="nl-chip" data-q="ביצים L 12 יחידות פיקוח">ביצים פיקוח</button>
+  </div>
   <div class="nl-explain" id="nl-explain" aria-live="polite"></div>
   <div class="nl-tool"    id="nl-tool"></div>
   <div class="ai-panel"   id="nl-ai" hidden></div>
@@ -57,8 +74,15 @@
 
 <!-- trends -->
 <section class="pane" id="pane-trends" role="tabpanel" aria-labelledby="tab-trends" hidden>
-  <form id="form-trends">
-    <input name="barcode" placeholder="ברקוד (13 ספרות)" aria-label="ברקוד" inputmode="numeric" pattern="\d*"/>
+  <form id="form-trends" autocomplete="off">
+    <div class="trend-search">
+      <input name="search" id="trend-search" type="text"
+             placeholder="חפש מוצר לפי שם או הזן ברקוד…"
+             aria-label="שם מוצר או ברקוד"
+             aria-autocomplete="list" aria-controls="trend-suggest"/>
+      <input name="barcode" id="trend-barcode" type="hidden"/>
+      <ul id="trend-suggest" class="suggest" role="listbox" hidden></ul>
+    </div>
     <select name="days" aria-label="טווח זמן">
       <option value="7">7 ימים</option>
       <option value="14">14 ימים</option>
@@ -67,8 +91,83 @@
     </select>
     <button type="submit">הצג</button>
   </form>
+  <div id="trend-meta" class="trend-meta hint"></div>
   <div id="trend-chart" class="chart-wrap" aria-label="גרף מחיר"></div>
   <div id="trend-table"></div>
+</section>
+
+<!-- dashboard -->
+<section class="pane" id="pane-dashboard" role="tabpanel" aria-labelledby="tab-dashboard" hidden>
+  <div class="loc-bar" role="region" aria-label="סינון לפי מיקום">
+    <div class="loc-bar-row">
+      <div class="loc-field">
+        <label for="loc-city">עיר</label>
+        <input id="loc-city" type="text" list="cities-datalist"
+               placeholder="כל הארץ" autocomplete="off"/>
+      </div>
+      <div class="loc-field loc-radius">
+        <label for="loc-radius">טווח <span id="loc-radius-label" class="hint"></span></label>
+        <input id="loc-radius" type="range" min="0" max="50" step="1" value="0"/>
+      </div>
+      <button type="button" class="btn-secondary" id="loc-geo" title="השתמש במיקום הנוכחי">📍 מיקום נוכחי</button>
+      <button type="button" class="link" id="loc-clear">נקה</button>
+    </div>
+    <div class="loc-hint" id="loc-status">
+      הכרטיסים מתעדכנים אוטומטית לפי הסינון. ⚙ בראש הדף = עוד הגדרות (רשתות).
+    </div>
+  </div>
+  <div class="dash-kpis" id="dash-kpis" aria-live="polite"></div>
+
+  <div class="dash-grid">
+    <section class="dash-card dash-span-2">
+      <header class="dash-head">
+        <h2>כיסוי לפי רשת</h2>
+        <span class="dash-sub" id="dash-chain-sub">מוצרים עם מחיר נוכחי</span>
+      </header>
+      <div id="dash-chain-chart" class="chart-wrap"></div>
+    </section>
+
+    <section class="dash-card">
+      <header class="dash-head">
+        <h2>בריאות סריקה</h2>
+        <span class="dash-sub">הרצה אחרונה לכל רשת</span>
+      </header>
+      <div id="dash-health" class="dash-list"></div>
+    </section>
+
+    <section class="dash-card">
+      <header class="dash-head">
+        <h2>פער מחירים הגדול ביותר</h2>
+        <span class="dash-sub">זול נגד יקר, לפי אחוז</span>
+      </header>
+      <div id="dash-spread" class="dash-list"></div>
+    </section>
+
+    <section class="dash-card">
+      <header class="dash-head">
+        <h2>מבצעים עדכניים</h2>
+        <span class="dash-sub">לפי סריקה אחרונה</span>
+      </header>
+      <div id="dash-promos" class="dash-list"></div>
+    </section>
+
+    <section class="dash-card">
+      <header class="dash-head">
+        <h2>ערים עם הכי הרבה חנויות</h2>
+        <span class="dash-sub">סיכום מלאי נקודות מכירה</span>
+      </header>
+      <div id="dash-cities" class="dash-list"></div>
+    </section>
+
+    <section class="dash-card dash-span-2">
+      <header class="dash-head">
+        <h2>היסטוריית ריצות סריקה</h2>
+        <span class="dash-sub">60 הריצות האחרונות</span>
+      </header>
+      <div id="dash-runs" class="dash-table-wrap"></div>
+    </section>
+
+  </div>
 </section>
 
 <!-- receipt -->
@@ -84,6 +183,16 @@
       </div>
     </label>
     <input name="city" placeholder="העיר שלך (לחיפוש חלופות)" aria-label="עיר"/>
+    <label class="provider-pick">
+      <span>מנוע OCR</span>
+      <select name="provider" id="receipt-provider" aria-label="בחר מנוע OCR">
+        <option value="">ברירת מחדל (Claude)</option>
+        <option value="auto">אוטומטי — חינם תחילה</option>
+        <option value="rapid">RapidOCR (מקומי, חינם)</option>
+        <option value="ocrspace">OCR.space (חינם, אונליין)</option>
+        <option value="claude">Claude (איכות גבוהה)</option>
+      </select>
+    </label>
     <button type="submit">העלה וחשב חיסכון</button>
   </form>
   <div class="progress" id="receipt-progress" hidden>
@@ -94,7 +203,106 @@
   <div id="receipt-result"></div>
 </section>
 
+<!-- scrape status (live) -->
+<section class="pane" id="pane-scrape" role="tabpanel" aria-labelledby="tab-scrape" hidden>
+  <div class="scrape-toolbar" role="region" aria-label="פעולות סטטוס סריקה">
+    <div class="scrape-summary" id="scrape-summary"></div>
+    <div class="scrape-actions">
+      <label class="auto-toggle">
+        <input type="checkbox" id="scrape-auto" checked/>
+        עדכון אוטומטי
+      </label>
+      <span class="last-update" id="scrape-last-update" aria-live="polite">—</span>
+      <button type="button" id="scrape-refresh" class="btn-secondary">רענן עכשיו</button>
+    </div>
+  </div>
+  <div id="scrape-table-wrap" class="dash-table-wrap"></div>
+</section>
+
+<!-- live OCR -->
+<section class="pane" id="pane-live" role="tabpanel" aria-labelledby="tab-live" hidden>
+  <div class="live-toolbar">
+    <button type="button" id="live-start"  class="btn-primary">▶ הפעל מצלמה</button>
+    <button type="button" id="live-stop"   class="btn-secondary" hidden>■ עצור</button>
+    <button type="button" id="live-reset"  class="btn-secondary" hidden>נקה רשימה</button>
+    <span class="live-status" id="live-status" aria-live="polite"></span>
+  </div>
+  <div class="live-grid">
+    <div class="live-stage">
+      <video id="live-video" playsinline muted autoplay></video>
+      <svg id="live-overlay" preserveAspectRatio="none" aria-hidden="true"></svg>
+      <div class="live-corners" aria-hidden="true">
+        <span></span><span></span><span></span><span></span>
+      </div>
+    </div>
+    <aside class="live-side" aria-label="פריטים מזוהים בזמן אמת">
+      <div class="live-totals" id="live-totals"></div>
+      <div class="live-items" id="live-items" role="list"></div>
+      <div class="live-legend" aria-hidden="true">
+        <span class="lk-barcode">ברקוד</span>
+        <span class="lk-price">מחיר</span>
+        <span class="lk-qty">כמות</span>
+      </div>
+    </aside>
+  </div>
+</section>
+
 </main>
+
+<!-- cities autocomplete (shared by settings + search forms) -->
+<datalist id="cities-datalist"></datalist>
+
+<!-- settings modal -->
+<div class="modal hidden" id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" hidden>
+  <div class="modal-body" role="document">
+    <button class="close" id="settings-close" aria-label="סגור">✕</button>
+    <h2 id="settings-title">הגדרות ומיקום</h2>
+    <form id="settings-form" class="settings-form">
+      <div class="field">
+        <label for="pref-city">עיר מועדפת</label>
+        <input id="pref-city" type="text" list="cities-datalist"
+               placeholder="התחל להקליד…" autocomplete="off"/>
+        <div class="hint">חיפוש יצומצם לחנויות בעיר זו</div>
+      </div>
+
+      <div class="field">
+        <label>מיקום מדויק</label>
+        <div class="row-inline">
+          <button type="button" id="pref-geo" class="btn-secondary">📍 השתמש במיקום הנוכחי</button>
+          <span class="hint" id="pref-geo-status">—</span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="pref-radius">טווח בק"מ <span id="pref-radius-label" class="hint"></span></label>
+        <input id="pref-radius" type="range" min="0" max="50" step="1" value="0"/>
+        <div class="hint">0 = ללא סינון מרחק. פעיל רק כאשר הוגדר מיקום מדויק (📍). הערה: לחלק גדול מהחנויות אין עיר/קואורדינטות במערכת — סינון טווח יצמצם תוצאות.</div>
+      </div>
+
+      <div class="field">
+        <label>רשתות מועדפות</label>
+        <div id="pref-chains" class="chain-chips" role="group" aria-label="רשתות"></div>
+        <div class="hint">השאר ריק כדי לחפש בכל הרשתות</div>
+      </div>
+
+      <div class="field">
+        <label for="pref-retention">ימי שמירת היסטוריה
+          <span id="pref-retention-label" class="hint"></span>
+        </label>
+        <input id="pref-retention" type="range" min="1" max="30" step="1" value="7"/>
+        <div class="hint">
+          כמה ימים של תצפיות מחיר נשמרים. ערך נמוך חוסך מקום אבל מקצר את גרף המחיר.
+          הסריקה היומית גורפת את היומיים האחרונים בלבד; הקיצוץ פועל בסוף כל סריקה.
+        </div>
+      </div>
+
+      <div class="settings-actions">
+        <button type="submit">שמור</button>
+        <button type="button" id="pref-clear" class="btn-danger">נקה הכל</button>
+      </div>
+    </form>
+  </div>
+</div>
 
 <!-- modal -->
 <div class="modal hidden" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" hidden>
