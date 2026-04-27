@@ -44,6 +44,15 @@ export function initNL() {
     submitQuery(form().elements.query.value);
   });
 
+  // Preset chips: clicking one fills the input and submits.
+  document.querySelectorAll("#nl-presets .nl-chip").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const q = btn.dataset.q || btn.textContent;
+      form().elements.query.value = q;
+      submitQuery(q);
+    });
+  });
+
   const { tab, params } = current();
   if (tab === "nl") {
     const q = params.get("q");
