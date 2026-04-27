@@ -1,7 +1,11 @@
 """Parse chain Stores / StoreFull XML into normalized rows."""
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Iterator
 
 from lxml import etree
@@ -17,6 +21,47 @@ class StoreRow:
     city: str | None
     zip_code: str | None
     store_type: str | None
+
+
+_CITIES_FILE = Path(__file__).resolve().parents[2] / "data" / "il_cities.json"
+_NUMERIC_RE = re.compile(r"^\d{1,7}$")
+
+
+@lru_cache(maxsize=1)
+def _known_cities() -> list[str]:
+    """Hebrew canonical city names from data/il_cities.json, longest-first
+    so 'תל אביב יפו' wins over 'תל אביב' when matching against a store name."""
+    try:
+        data = json.loads(_CITIES_FILE.read_text())
+    except Exception:
+        return []
+    names: set[str] = set()
+    for c in data:
+        n = c.get("name_he") or c.get("name") or c.get("canonical")
+        if n:
+            names.add(n)
+        for a in c.get("aliases") or []:
+            names.add(a)
+    return sorted(names, key=len, reverse=True)
+
+
+def _city_from_name(store_name: str | None) -> str | None:
+    """Carrefour publishes postal codes in <City>; extract a Hebrew city from
+    the store name as a fallback. We scan the name for any known city string."""
+    if not store_name:
+        return None
+    for city in _known_cities():
+        if city in store_name:
+            return city
+    return None
+
+
+def _normalize_city(raw_city: str | None, store_name: str | None) -> str | None:
+    """If <City> is purely numeric (postal code), try the store name; else
+    return <City> as-is. Empty strings collapse to None."""
+    if raw_city and not _NUMERIC_RE.match(raw_city.strip()):
+        return raw_city.strip()
+    return _city_from_name(store_name)
 
 
 def parse(xml_bytes: bytes) -> Iterator[StoreRow]:
@@ -52,13 +97,14 @@ def parse(xml_bytes: bytes) -> Iterator[StoreRow]:
             if not code:
                 elem.clear()
                 continue
+            store_name = fields.get("storename")
             yield StoreRow(
                 chain_id=fields.get("chainid") or chain_id,
                 sub_chain_id=fields.get("subchainid") or sub_chain_id,
                 store_code=code,
-                name=fields.get("storename"),
+                name=store_name,
                 address=fields.get("address"),
-                city=fields.get("city"),
+                city=_normalize_city(fields.get("city"), store_name),
                 zip_code=fields.get("zipcode"),
                 store_type=fields.get("storetype"),
             )
