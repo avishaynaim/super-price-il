@@ -84,3 +84,9 @@ def cities_stats():
 @stats_router.get("/promo-counts")
 def promo_counts():
     return []
+
+
+@stats_router.get("/retailers-status")
+def retailers_status():
+    res = supa.sb().rpc("retailers_status").execute()
+    return res.data or []
