@@ -136,7 +136,11 @@ class PublishedPricesScraper(BaseChainScraper):
                         sub = (cd.rstrip("/") + "/" + name) if cd != "/" else "/" + name
                         next_queue.append(sub)
                         continue
-                    if rtype != "file" or not name.endswith(".gz"):
+                    # Accept .gz (Price/Promo/PriceFull/PromoFull) and .xml
+                    # (Stores files on most publishedprices chains aren't gzipped —
+                    # same quirk as Carrefour). base._decompress dispatches by
+                    # magic bytes so the consumer side handles both transparently.
+                    if rtype != "file" or not name.endswith((".gz", ".xml")):
                         continue
                     try:
                         published = datetime.fromisoformat(row["time"].replace("Z", "+00:00"))
