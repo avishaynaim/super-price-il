@@ -7,6 +7,7 @@ const SB_HDR = () => ({
   "apikey": SUPABASE_KEY,
   "Authorization": "Bearer " + SUPABASE_KEY,
   "Content-Type": "application/json",
+  "Prefer": "return=representation",
 });
 
 async function sbRpc(fn, params = {}) {
@@ -15,7 +16,11 @@ async function sbRpc(fn, params = {}) {
     headers: SB_HDR(),
     body: JSON.stringify(params),
   });
-  if (!r.ok) throw { detail: `Supabase RPC ${fn} → HTTP ${r.status}`, status: r.status };
+  if (!r.ok) {
+    let msg = `Supabase RPC ${fn} → HTTP ${r.status}`;
+    try { const j = await r.json(); msg = j.message || j.hint || msg; } catch {}
+    throw { detail: msg, status: r.status };
+  }
   return r.json();
 }
 
@@ -25,6 +30,18 @@ async function sbGet(table, query = {}) {
   const r = await fetch(url, { headers: SB_HDR() });
   if (!r.ok) throw { detail: `Supabase GET ${table} → HTTP ${r.status}`, status: r.status };
   return r.json();
+}
+
+async function sbCount(table, query = {}) {
+  const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
+  url.searchParams.set("select", "id");
+  for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
+  const r = await fetch(url, {
+    method: "HEAD",
+    headers: { ...SB_HDR(), "Prefer": "count=exact" },
+  });
+  const cr = r.headers.get("content-range") || "";
+  return parseInt(cr.split("/")[1] || "0", 10);
 }
 
 // ── Supabase-backed API surface ────────────────────────────────────────────
@@ -37,8 +54,13 @@ async function sbDispatch(path, query = {}, init = {}) {
 
   // GET /api/health
   if (path === "/api/health") {
-    const rows = await sbGet("chains", { "active": "eq.true", "select": "id" });
-    return { status: "ok", chains_active: rows.length };
+    const [chains_active, stores, products, current_prices] = await Promise.all([
+      sbCount("chains", { "active": "eq.true" }),
+      sbCount("stores"),
+      sbCount("products"),
+      sbCount("current_prices"),
+    ]);
+    return { status: "ok", chains_active, stores, products, current_prices };
   }
 
   // GET /api/chains
@@ -104,11 +126,52 @@ async function sbDispatch(path, query = {}, init = {}) {
     });
   }
 
-  // GET /api/cities
-  if (path === "/api/cities") {
-    const rows = await sbGet("stores", { "select": "city", "city": "not.is.null" });
+  // GET /api/stats/retailers-status
+  if (path === "/api/stats/retailers-status") return sbRpc("retailers_status");
+
+  // GET /api/stats/scrape-runs
+  if (path === "/api/stats/scrape-runs") {
+    const rows = await sbGet("scrape_runs", {
+      "select": "id,chain_id,started_at,finished_at,status,files_ok,files_failed,files_total,rows_written,error_msg",
+      "order":  "started_at.desc",
+      "limit":  query.limit || "60",
+    });
+    // attach chain codes from chains table
+    const chainRows = await sbGet("chains", { "select": "id,code,name_he" });
+    const chainMap = {};
+    for (const c of chainRows) chainMap[c.id] = c;
+    return rows.map(r => ({
+      ...r,
+      chain_code:    chainMap[r.chain_id]?.code    || "",
+      chain_name_he: chainMap[r.chain_id]?.name_he || "",
+    }));
+  }
+
+  // GET /api/stats/recent-promotions
+  if (path === "/api/stats/recent-promotions") return [];
+
+  // GET /api/stats/cities
+  if (path === "/api/stats/cities") {
+    const rows = await sbGet("stores", { "select": "city", "not.city": "is.null", "limit": "5000" });
     const counts = {};
-    for (const r of rows) counts[r.city] = (counts[r.city] || 0) + 1;
+    for (const r of rows) {
+      const c = (r.city || "").trim();
+      if (c) counts[c] = (counts[c] || 0) + 1;
+    }
+    return Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 50)
+      .map(([city, stores]) => ({ city, stores }));
+  }
+
+  // GET /api/cities  (geo module)
+  if (path === "/api/cities") {
+    const rows = await sbGet("stores", { "select": "city", "limit": "5000" });
+    const counts = {};
+    for (const r of rows) {
+      const c = (r.city || "").trim();
+      if (c) counts[c] = (counts[c] || 0) + 1;
+    }
     return Object.entries(counts)
       .sort((a, b) => b[1] - a[1])
       .map(([name_he, store_count]) => ({ name_he, store_count }));
@@ -118,7 +181,7 @@ async function sbDispatch(path, query = {}, init = {}) {
   if (path === "/api/stores") {
     const q = {
       "select": "id,store_code,name,city,address,chain_id",
-      "limit": query.limit || "500",
+      "limit":  query.limit || "500",
     };
     if (query.city) q["city"] = `ilike.*${query.city}*`;
     return sbGet("stores", q);
