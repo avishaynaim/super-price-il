@@ -4,6 +4,7 @@ import { api } from "./api.js";
 import { debounce, renderRows, renderError, toast } from "./ui.js";
 import { openProduct } from "./product.js";
 import { current, setRoute } from "./router.js";
+import { getPrefs, prefsQuery, onPrefsChange } from "./prefs.js";
 
 const root   = () => document.getElementById("results-search");
 const form   = () => document.getElementById("form-search");
@@ -22,10 +23,14 @@ async function runSearch(push = true) {
   if (push) setRoute("search", { q, chain, city });
   if (!q) { r.innerHTML = '<div class="empty">הקלד שם מוצר או ברקוד</div>'; return; }
 
+  // Merge saved prefs (radius/coords/default-chain) unless the form
+  // already specifies that field. Form overrides prefs.
+  const extra = prefsQuery({ includeCity: !city, includeChain: !chain });
+
   const token = ++lastToken;
   r.innerHTML = '<div class="loading">מחפש…</div>';
   try {
-    const rows = await api("/api/search", { q, chain, city, limit: 40 });
+    const rows = await api("/api/search", { q, chain, city, limit: 40, ...extra });
     if (token !== lastToken) return; // stale response, ignore
     renderRows(r, rows, { onOpen: openProduct });
   } catch (err) {
@@ -42,6 +47,21 @@ export function initSearch() {
   qEl().addEventListener("input", debounced);
   chainEl().addEventListener("change", () => runSearch(true));
   cityEl().addEventListener("input", debounced);
+
+  // Bind the shared IL-cities datalist onto the search form's city input too.
+  cityEl().setAttribute("list", "cities-datalist");
+
+  // Prefill an empty city field with the saved preference — the user can still
+  // clear it to search everywhere.
+  const prefs = getPrefs();
+  if (!cityEl().value && prefs.city) cityEl().value = prefs.city;
+  if (!chainEl().value && prefs.preferred_chains.length === 1) chainEl().value = prefs.preferred_chains[0];
+
+  // Re-run when prefs change so results reflect the new location.
+  onPrefsChange(() => {
+    const q = qEl().value.trim();
+    if (q) runSearch(false);
+  });
 
   // Restore state from URL.
   const { tab, params } = current();
