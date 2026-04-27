@@ -12,17 +12,8 @@ import httpx
 import typer
 from rich.console import Console
 
-from ..db.connection import connect
-from ..db.migrate import migrate
-from ..db.seed import seed_chains
-from ..db.upsert import (
-    chain_id_for_code,
-    get_or_create_store_by_code,
-    insert_observations,
-    insert_promotions,
-    upsert_store,
-)
-from ..parser import pricefull, promofull, stores as stores_parser
+from ..db import supa
+from ..parser import pricefull, stores as stores_parser
 from ..scraper.chains.shufersal import ShufersalScraper
 from ..scraper.chains.publishedprices import (
     PublishedPricesScraper,
@@ -31,6 +22,10 @@ from ..scraper.chains.publishedprices import (
 from ..scraper.chains.laibcatalog import (
     LaibcatalogScraper,
     make_client_for_laibcatalog,
+)
+from ..scraper.chains.laibcatalog_v2 import (
+    LaibcatalogV2Scraper,
+    make_client_for_laibcatalog_v2,
 )
 from ..scraper.chains.binaprojects import (
     BinaprojectsScraper,
@@ -44,38 +39,15 @@ from ..scraper.chains.custom import (
     CityMarketScraper, make_client_for_citymarket,
     ChpKtScraper, make_client_for_chpkt,
 )
+from ..scraper.chains.netiv import NetivScraper, make_client_for_netiv
 from ..scraper.registry import BY_CODE
 
 app = typer.Typer(help="Backfill price data into prices.db")
 console = Console()
 
 SCRAPERS = {
-    "shufersal":           ShufersalScraper,
-    "rami_levi":           PublishedPricesScraper,
-    "yohananof":           PublishedPricesScraper,
-    "tiv_taam":            PublishedPricesScraper,
-    # Re-enabled 2026-04-21 — gov.il confirms they serve via Cerberus:
-    "osher_ad":            PublishedPricesScraper,
-    "keshet":              PublishedPricesScraper,
-    # Added 2026-04-21 — more publishedprices users from gov.il:
-    "dor_alon":            PublishedPricesScraper,
-    "super_cofix":         PublishedPricesScraper,
-    "politzer":            PublishedPricesScraper,
-    "salach_dabah":        PublishedPricesScraper,
-    "freshmarket":         PublishedPricesScraper,
-    "paz_yellow":          PublishedPricesScraper,
-    "super_yuda":          PublishedPricesScraper,
-    "stop_market":         PublishedPricesScraper,   # different Cerberus host; scraper reads from spec.portal_url
-    "victory":             LaibcatalogScraper,
-    "machsanei_hashuk":    LaibcatalogScraper,
-    "cohen_h":             LaibcatalogScraper,
-    "mega":                MegaScraper,
-    "hazi_hinam":          HaziHinamScraper,
-    "super_pharm":         SuperPharmScraper,
-    "wolt":                WoltScraper,
-    "citymarket":          CityMarketScraper,
-    "chp_kt":              ChpKtScraper,
-    # All binaprojects chains use the same scraper — only the spec differs:
+    # --- fast chains first so they always complete before the giants ---
+    # binaprojects: small catalogs, each <5 min
     "king_store":          BinaprojectsScraper,
     "maayan2000":          BinaprojectsScraper,
     "good_pharm":          BinaprojectsScraper,
@@ -86,6 +58,36 @@ SCRAPERS = {
     "shefa_berkat_hashem": BinaprojectsScraper,
     "citymarket_kiryatgat": BinaprojectsScraper,
     "ktshivuk":            BinaprojectsScraper,
+    # custom small scrapers
+    "chp_kt":              ChpKtScraper,
+    "wolt":                WoltScraper,
+    "citymarket":          CityMarketScraper,
+    "netiv_hahesed":       NetivScraper,
+    "cohen_h":             LaibcatalogScraper,
+    # laibcatalog v2
+    "victory":             LaibcatalogV2Scraper,
+    "machsanei_hashuk":    LaibcatalogV2Scraper,
+    # medium publishedprices chains (many files but login-gated → smaller sets)
+    "super_cofix":         PublishedPricesScraper,
+    "paz_yellow":          PublishedPricesScraper,
+    "super_yuda":          PublishedPricesScraper,
+    "stop_market":         PublishedPricesScraper,
+    "politzer":            PublishedPricesScraper,
+    "salach_dabah":        PublishedPricesScraper,
+    "freshmarket":         PublishedPricesScraper,
+    "dor_alon":            PublishedPricesScraper,
+    "keshet":              PublishedPricesScraper,
+    "osher_ad":            PublishedPricesScraper,
+    # medium custom
+    "hazi_hinam":          HaziHinamScraper,
+    "super_pharm":         SuperPharmScraper,
+    # large publishedprices chains
+    "yohananof":           PublishedPricesScraper,
+    "tiv_taam":            PublishedPricesScraper,
+    # --- giants last — if the timer kills them, smaller chains already ran ---
+    "mega":                MegaScraper,
+    "rami_levi":           PublishedPricesScraper,
+    "shufersal":           ShufersalScraper,
 }
 
 PUBLISHEDPRICES_CODES = {
@@ -106,8 +108,34 @@ NEEDS_INSECURE = (
     PUBLISHEDPRICES_CODES
     | BINAPROJECTS_CODES
     | {"victory", "machsanei_hashuk", "cohen_h", "mega", "hazi_hinam",
-       "super_pharm", "wolt", "citymarket", "chp_kt"}
+       "super_pharm", "wolt", "citymarket", "chp_kt", "netiv_hahesed"}
 )
+
+
+def _filter_overdue(chains: list[str], threshold_days: int) -> list[str]:
+    """Drop chains that finished a successful scrape within `threshold_days`."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=threshold_days)).isoformat(timespec="seconds")
+    res = supa.sb().table("scrape_runs").select("chain_id,finished_at,chains(code)").eq("status", "ok").execute()
+    last_ok: dict[str, str] = {}
+    for r in (res.data or []):
+        code = r.get("chains", {}).get("code", "")
+        fa = r.get("finished_at", "")
+        if code and fa and fa > last_ok.get(code, ""):
+            last_ok[code] = fa
+    overdue, skipped = [], []
+    for code in chains:
+        l = last_ok.get(code)
+        if l and l >= cutoff:
+            skipped.append((code, l))
+        else:
+            overdue.append(code)
+    if skipped:
+        console.print(
+            f"[dim]skipping {len(skipped)} recently-scraped chain(s) "
+            f"(within {threshold_days}d): {', '.join(c for c, _ in skipped)}[/dim]"
+        )
+    console.print(f"[bold]running {len(overdue)} chain(s)[/bold] (overdue or never scraped)")
+    return overdue
 
 
 async def run_chain(
@@ -122,7 +150,9 @@ async def run_chain(
         console.print(f"[yellow]no scraper yet for {code}; skipping[/yellow]")
         return (0, 0)
 
-    if code in {"victory", "machsanei_hashuk", "cohen_h"}:
+    if spec.auth_kind == "laibcatalog_v2":
+        client_cm = make_client_for_laibcatalog_v2()
+    elif code in {"victory", "machsanei_hashuk", "cohen_h"}:
         client_cm = make_client_for_laibcatalog()
     elif code in BINAPROJECTS_CODES:
         client_cm = make_client_for_binaprojects()
@@ -138,6 +168,8 @@ async def run_chain(
         client_cm = make_client_for_citymarket()
     elif code == "chp_kt":
         client_cm = make_client_for_chpkt()
+    elif code == "netiv_hahesed":
+        client_cm = make_client_for_netiv()
     elif code in NEEDS_INSECURE:
         client_cm = make_client_for_publishedprices()
     else:
@@ -146,55 +178,68 @@ async def run_chain(
             timeout=httpx.Timeout(connect=15, read=120, write=30, pool=30),
             follow_redirects=True,
         )
+
+    chain_id = supa.chain_id_for_code(code)
+    run_id = supa.scrape_run_start(chain_id)
+
+    def _on_listed(total: int) -> None:
+        try:
+            supa.scrape_run_update(run_id, files_total=total)
+        except Exception:
+            pass
+
+    def _on_downloaded(done: int, total: int) -> None:
+        try:
+            supa.scrape_run_update(run_id, files_ok=done, files_total=total)
+        except Exception:
+            pass
+
     async with client_cm as client:
         scraper = scraper_cls(spec, client)
-        files = await scraper.run(since=since, limit=limit, kinds=kinds)
+        files = await scraper.run(
+            since=since, limit=limit, kinds=kinds,
+            on_listed=_on_listed, on_downloaded=_on_downloaded,
+        )
 
-    conn = connect()
-    chain_id = chain_id_for_code(conn, code)
-    started = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    conn.execute(
-        "INSERT INTO scrape_runs(chain_id, started_at, status) VALUES (?, ?, 'running')",
-        (chain_id, started),
-    )
-    run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    # Wipe this chain's previous prices before inserting fresh ones (1-day retention).
+    supa.delete_chain_current_prices(chain_id)
 
     files_ok = files_failed = rows_written = 0
-    try:
-        for df in files:
-            try:
-                if df.remote.kind in {"Stores", "StoresFull"}:
-                    for sr in stores_parser.parse(df.xml_bytes):
-                        upsert_store(conn, chain_id, sr)
-                elif df.remote.kind in {"PriceFull", "Price"}:
-                    header, rows = pricefull.parse(df.xml_bytes)
-                    store_code = df.remote.store_code or header.store_id
-                    if not store_code:
-                        files_failed += 1
-                        continue
-                    store_id = get_or_create_store_by_code(conn, chain_id, store_code)
-                    rows_written += insert_observations(conn, store_id, rows, str(df.path))
-                elif df.remote.kind in {"PromoFull", "Promo"}:
-                    header, promos = promofull.parse(df.xml_bytes)
-                    store_code = df.remote.store_code or header.store_id
-                    store_id = (
-                        get_or_create_store_by_code(conn, chain_id, store_code)
-                        if store_code else None
-                    )
-                    rows_written += insert_promotions(conn, chain_id, store_id, promos)
-                files_ok += 1
-            except Exception as e:
-                console.print(f"[red]{df.remote.filename}: {e}[/red]")
-                files_failed += 1
-        conn.execute(
-            "UPDATE scrape_runs SET finished_at=?, status=?, files_ok=?, files_failed=?, rows_written=? WHERE id=?",
-            (datetime.now(timezone.utc).isoformat(timespec="seconds"),
-             "ok" if files_failed == 0 else "partial",
-             files_ok, files_failed, rows_written, run_id),
-        )
-    finally:
-        conn.close()
+    last_heartbeat = 0.0
+    HEARTBEAT_EVERY_SEC = 10.0
+    # Per-run product barcode→id cache so repeated products across files skip extra round-trips.
+    product_cache: dict[str, int] = {}
 
+    for df in files:
+        try:
+            if df.remote.kind in {"Stores", "StoresFull"}:
+                for sr in stores_parser.parse(df.xml_bytes):
+                    supa.upsert_store(chain_id, sr)
+            elif df.remote.kind in {"PriceFull", "Price"}:
+                header, rows = pricefull.parse(df.xml_bytes)
+                store_code = df.remote.store_code or header.store_id
+                if not store_code:
+                    files_failed += 1
+                    continue
+                store_id = supa.get_or_create_store_by_code(chain_id, store_code)
+                rows_written += supa.insert_observations(
+                    chain_id, store_id, rows, str(df.path), product_cache
+                )
+            files_ok += 1
+        except Exception as e:
+            console.print(f"[red]{df.remote.filename}: {e}[/red]")
+            files_failed += 1
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if now_ts - last_heartbeat >= HEARTBEAT_EVERY_SEC:
+            try:
+                supa.scrape_run_update(run_id, files_ok=files_ok, files_failed=files_failed, rows_written=rows_written)
+            except Exception:
+                pass
+            last_heartbeat = now_ts
+
+    status = "ok" if files_failed == 0 else "partial"
+    supa.scrape_run_finish(run_id, status, files_ok, files_failed, rows_written)
     return files_ok, rows_written
 
 
@@ -202,18 +247,27 @@ async def run_chain(
 def main(
     chain: str = typer.Option("shufersal", help="chain code or 'all'"),
     days: int = typer.Option(1, help="how many days back to fetch (default: 1)"),
-    retain: int = typer.Option(7, help="days of history to keep in DB + raw/ (default: 7)"),
+    retain: int = typer.Option(0, help="days of history to keep in DB + raw/ (0 = settings.retention_days)"),
     limit: int = typer.Option(0, help="cap files per chain (0 = no cap)"),
     kinds: str = typer.Option("", help="comma-sep subset: PriceFull,Price,PromoFull,Promo,Stores,StoresFull"),
     no_prune: bool = typer.Option(False, "--no-prune", help="skip retention prune after scrape"),
+    skip_recent: int = typer.Option(
+        0,
+        help="skip chains whose last successful scrape finished within N days "
+             "(0 = always scrape; weekly cron uses 7).",
+    ),
 ) -> None:
-    migrate()
-    seed_chains()
+    # Seed chains into Supabase on every run (idempotent upsert).
+    from ..scraper.registry import CHAINS as _CHAINS
+    supa.seed_chains(_CHAINS)
 
     since = datetime.now(timezone.utc) - timedelta(days=days)
     chains = list(SCRAPERS.keys()) if chain == "all" else [chain]
     cap = limit or None
     kind_set = {k.strip() for k in kinds.split(",") if k.strip()} or None
+
+    if skip_recent > 0:
+        chains = _filter_overdue(chains, skip_recent)
 
     for c in chains:
         console.rule(f"[bold]{c}")
@@ -222,8 +276,7 @@ def main(
 
     if not no_prune:
         from .prune import prune
-        console.rule("[bold]prune")
-        prune(retain_days=retain)
+        prune()
 
 
 if __name__ == "__main__":
