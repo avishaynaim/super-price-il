@@ -3,6 +3,7 @@
 
 import { api } from "./api.js";
 import { shekel, escapeHtml, renderError } from "./ui.js";
+import { prefsQuery } from "./prefs.js";
 
 const modal    = () => document.getElementById("modal");
 const content  = () => document.getElementById("modal-content");
@@ -51,10 +52,13 @@ export async function openProduct(barcode) {
   closeBtn().focus();
 
   try {
+    // Apply the full user scope — city/radius AND preferred chains — to
+    // every call so compare, price list, and promotions stay consistent.
+    const scope = prefsQuery({ includeChain: true });
     const [p, cmp, promos] = await Promise.all([
-      api(`/api/products/${encodeURIComponent(barcode)}`),
-      api(`/api/compare/${encodeURIComponent(barcode)}`),
-      api(`/api/promotions/${encodeURIComponent(barcode)}`).catch(() => []),
+      api(`/api/products/${encodeURIComponent(barcode)}`,   scope),
+      api(`/api/compare/${encodeURIComponent(barcode)}`,    scope),
+      api(`/api/promotions/${encodeURIComponent(barcode)}`, scope).catch(() => []),
     ]);
     titleEl().textContent = `${p.name || barcode}  ·  ${barcode}`;
     content().innerHTML = render(p, cmp, promos);
