@@ -102,25 +102,59 @@ class BaseChainScraper(abc.ABC):
         concurrency: int = 6,
         limit: int | None = None,
         kinds: set[str] | None = None,
+        on_listed: "callable | None" = None,
+        on_downloaded: "callable | None" = None,
     ) -> list[DownloadedFile]:
+        """Authenticate, list files, download in parallel.
+
+        Optional progress callbacks let the orchestrator (cli/backfill.py)
+        update the scrape_runs row in real time:
+          on_listed(total: int) — fired once after listing is complete.
+          on_downloaded(done: int, total: int) — fired after EACH file lands.
+        Both callbacks are optional and synchronous; failures are swallowed.
+        """
         await self.authenticate()
         sem = asyncio.Semaphore(concurrency)
 
-        async def _fetch(rf: RemoteFile) -> DownloadedFile:
-            async with sem:
-                return await self.download(rf)
-
-        tasks: list[asyncio.Task[DownloadedFile]] = []
-        # list_files accepts `kinds` when the subclass implements pagination-by-kind;
-        # older subclasses ignore the kwarg safely.
+        # Materialize the file list first so we can announce a stable `total`
+        # to the orchestrator before any downloads start. This is critical for
+        # live progress: the dashboard's "running_now" turns yellow as soon as
+        # we know how many files we're going to fetch.
         try:
             gen = self.list_files(since=since, kinds=kinds)
         except TypeError:
             gen = self.list_files(since=since)
+        listed: list[RemoteFile] = []
         async for rf in gen:
             if kinds and rf.kind not in kinds:
                 continue
-            tasks.append(asyncio.create_task(_fetch(rf)))
-            if limit and len(tasks) >= limit:
+            listed.append(rf)
+            if limit and len(listed) >= limit:
                 break
-        return await asyncio.gather(*tasks)
+
+        if on_listed is not None:
+            try: on_listed(len(listed))
+            except Exception: pass
+
+        done = 0
+        results: list[DownloadedFile] = []
+        async def _fetch(rf: RemoteFile) -> DownloadedFile:
+            nonlocal done
+            async with sem:
+                df = await self.download(rf)
+            done += 1
+            if on_downloaded is not None:
+                try: on_downloaded(done, len(listed))
+                except Exception: pass
+            return df
+
+        tasks = [asyncio.create_task(_fetch(rf)) for rf in listed]
+        for t in asyncio.as_completed(tasks):
+            try:
+                results.append(await t)
+            except Exception:
+                # Surface as a count drop — the orchestrator's parse loop will
+                # never see this file. We still count it via on_downloaded so
+                # the progress denominator includes failed downloads.
+                pass
+        return results
