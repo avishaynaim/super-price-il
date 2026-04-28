@@ -149,8 +149,42 @@ async function sbDispatch(path, query = {}, init = {}) {
   // GET /api/stats/chain-stores/:code
   const chainStoresM = path.match(/^\/api\/stats\/chain-stores\/(.+)$/);
   if (chainStoresM) {
-    const rows = await sbRpc("get_chain_stores", { p_code: chainStoresM[1] });
-    return rows[0] || { chain: null, totals: {}, stores: [] };
+    const code = chainStoresM[1];
+    const chains = await sbGet("chains", {
+      "select": "id,name_he,name_en,portal_url",
+      "code":   `eq.${code}`,
+    });
+    if (!chains.length) return { chain: null, totals: {}, stores: [] };
+    const chain = chains[0];
+    const [storeRows, cacheRows] = await Promise.all([
+      sbGet("stores", {
+        "select":   "id,store_code,name,city,address",
+        "chain_id": `eq.${chain.id}`,
+        "order":    "city.asc.nullslast,name.asc.nullslast",
+        "limit":    "1000",
+      }),
+      sbGet("store_prices_cache", {
+        "select":   "store_id,prices,last_priced",
+        "chain_id": `eq.${chain.id}`,
+      }),
+    ]);
+    const priceMap = {};
+    for (const r of cacheRows) priceMap[r.store_id] = r;
+    const stores = storeRows.map(s => ({
+      store_code:  s.store_code,
+      name:        s.name,
+      city:        s.city,
+      address:     s.address,
+      prices:      priceMap[s.id]?.prices      || 0,
+      last_priced: priceMap[s.id]?.last_priced || null,
+    }));
+    const totals = {
+      total:          stores.length,
+      with_prices:    stores.filter(s => s.prices > 0).length,
+      missing_prices: stores.filter(s => s.prices === 0).length,
+      with_city:      stores.filter(s => s.city).length,
+    };
+    return { chain, totals, stores };
   }
 
   // GET /api/stats/cities
@@ -169,15 +203,16 @@ async function sbDispatch(path, query = {}, init = {}) {
 
   // GET /api/cities  (geo module)
   if (path === "/api/cities") {
-    const rows = await sbGet("stores", { "select": "city", "limit": "5000" });
+    const rows = await sbGet("stores", { "select": "city", "city": "not.is.null", "limit": "5000" });
     const counts = {};
     for (const r of rows) {
       const c = (r.city || "").trim();
-      if (c) counts[c] = (counts[c] || 0) + 1;
+      // Skip purely numeric codes (stale data not yet re-normalised)
+      if (c && !/^\d+$/.test(c)) counts[c] = (counts[c] || 0) + 1;
     }
     return Object.entries(counts)
-      .sort((a, b) => b[1] - a[1])
-      .map(([name_he, store_count]) => ({ name_he, store_count }));
+      .sort((a, b) => a[0].localeCompare(b[0], "he"))
+      .map(([name_he, stores]) => ({ name_he, stores }));
   }
 
   // GET /api/stores

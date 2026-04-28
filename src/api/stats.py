@@ -124,3 +124,38 @@ def promo_counts():
 def retailers_status():
     res = supa.sb().rpc("retailers_status").execute()
     return res.data or []
+
+
+@stats_router.get("/chain-stores/{chain_code}")
+def chain_stores(chain_code: str):
+    from ..db.pg import cursor as _cursor
+    with _cursor() as cur:
+        cur.execute(
+            "SELECT id, name_he, name_en, portal_url FROM chains WHERE code=%s",
+            (chain_code,),
+        )
+        ch = cur.fetchone()
+        if not ch:
+            return {"chain": None, "totals": {}, "stores": []}
+        chain_id = ch["id"]
+        cur.execute(
+            """
+            SELECT s.store_code, s.name, s.city, s.address,
+                   COUNT(cp.product_id)  AS prices,
+                   MAX(cp.updated_at)::TEXT AS last_priced
+            FROM stores s
+            LEFT JOIN current_prices cp ON cp.store_id = s.id
+            WHERE s.chain_id = %s
+            GROUP BY s.id, s.store_code, s.name, s.city, s.address
+            ORDER BY s.city NULLS LAST, s.name NULLS LAST
+            """,
+            (chain_id,),
+        )
+        stores = [dict(r) for r in cur.fetchall()]
+    totals = {
+        "total":          len(stores),
+        "with_prices":    sum(1 for s in stores if (s["prices"] or 0) > 0),
+        "missing_prices": sum(1 for s in stores if (s["prices"] or 0) == 0),
+        "with_city":      sum(1 for s in stores if s["city"]),
+    }
+    return {"chain": dict(ch), "totals": totals, "stores": stores}
