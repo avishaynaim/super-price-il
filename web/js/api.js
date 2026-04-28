@@ -203,16 +203,8 @@ async function sbDispatch(path, query = {}, init = {}) {
 
   // GET /api/cities  (geo module)
   if (path === "/api/cities") {
-    const rows = await sbGet("stores", { "select": "city", "city": "not.is.null", "limit": "5000" });
-    const counts = {};
-    for (const r of rows) {
-      const c = (r.city || "").trim();
-      // Skip purely numeric codes (stale data not yet re-normalised)
-      if (c && !/^\d+$/.test(c)) counts[c] = (counts[c] || 0) + 1;
-    }
-    return Object.entries(counts)
-      .sort((a, b) => a[0].localeCompare(b[0], "he"))
-      .map(([name_he, stores]) => ({ name_he, stores }));
+    // Use RPC so GROUP BY runs in SQL — avoids the 1000-row REST cap on raw table scans
+    return sbRpc("list_cities");
   }
 
   // GET /api/stores

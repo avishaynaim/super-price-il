@@ -279,6 +279,19 @@ LANGUAGE sql STABLE SECURITY DEFINER AS $$
     ORDER BY ch.name_he;
 $$;
 
+-- City list with store counts (avoids per-row REST limit)
+CREATE OR REPLACE FUNCTION list_cities()
+RETURNS TABLE(name_he TEXT, stores BIGINT)
+LANGUAGE sql STABLE SECURITY DEFINER AS $$
+    SELECT city AS name_he, COUNT(*) AS stores
+    FROM stores
+    WHERE city IS NOT NULL
+      AND city != ''
+      AND city !~ '^\d+$'
+    GROUP BY city
+    ORDER BY city;
+$$;
+
 -- Top price spread: products with biggest min/max gap across chains
 CREATE OR REPLACE FUNCTION top_price_spread(
     city_spellings TEXT[]  DEFAULT NULL,
