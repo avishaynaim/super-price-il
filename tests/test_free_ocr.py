@@ -7,7 +7,9 @@ and the OCR_PROVIDER chain (auto = rapid → ocrspace → claude fallback).
 """
 from __future__ import annotations
 
+import re
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -38,10 +40,34 @@ def stub_db(tmp_path, monkeypatch):
     )
     c.commit(); c.close()
 
-    def _fake_connect(*a, **kw):
-        x = sqlite3.connect(str(db)); x.row_factory = sqlite3.Row; return x
+    class _SqliteCursor:
+        def __init__(self, conn):
+            conn.row_factory = sqlite3.Row
+            self._cur = conn.cursor()
 
-    monkeypatch.setattr(PL, "connect", _fake_connect)
+        def execute(self, sql, params=()):
+            # Convert PostgreSQL's = ANY(%s) (with a list arg) to SQLite IN (?,...)
+            if params and len(params) == 1 and isinstance(params[0], (list, tuple)):
+                lst = list(params[0])
+                sql = re.sub(r"= ANY\(%s\)", "IN (" + ",".join(["?"] * len(lst)) + ")", sql)
+                params = tuple(lst)
+            else:
+                sql = sql.replace("%s", "?")
+                params = tuple(params)
+            self._cur.execute(sql, params)
+
+        def fetchall(self):
+            return [{k: row[k] for k in row.keys()} for row in self._cur.fetchall()]
+
+    @contextmanager
+    def _fake_pg_cursor():
+        conn = sqlite3.connect(str(db))
+        try:
+            yield _SqliteCursor(conn)
+        finally:
+            conn.close()
+
+    monkeypatch.setattr(PL, "_pg_cursor", _fake_pg_cursor)
     return db
 
 
@@ -177,38 +203,29 @@ def test_extract_provider_rapid_uses_free_chain(stub_db, monkeypatch):
     assert ex.ai["provider"] == "stub"
 
 
-def test_extract_provider_auto_falls_back_to_claude(stub_db, monkeypatch):
-    """Free chain returns empty → auto falls through to Claude (which we stub)."""
+def test_extract_provider_auto_raises_when_all_empty(stub_db, monkeypatch):
+    """Auto chain: all providers return empty lines → RuntimeError raised."""
     empty = OCRResult(lines=[], provider="rapid-empty", latency_ms=1, image_size=(10, 10))
     monkeypatch.setattr(F, "rapid_ocr", lambda b: empty)
     monkeypatch.setattr(F, "ocrspace_ocr", lambda b, engine=2: empty)
-
-    sentinel = P.Extracted(
-        items=[P.ExtractedItem("מ", None, None, None, 1.0)],
-        total_paid=1.0, chain_guess=None, city=None, ai={"model": "fake"},
-    )
-    monkeypatch.setattr(P, "_call_claude_on_image", lambda data, media_type: sentinel)
-    ex = P.extract_from_image(b"\x00", "image/jpeg", provider="auto")
-    assert ex is sentinel
+    with pytest.raises(RuntimeError, match="returned no lines"):
+        P.extract_from_image(b"\x00", "image/jpeg", provider="auto")
 
 
 def test_extract_provider_rapid_no_items_raises(stub_db, monkeypatch):
-    """Single-provider mode with no items must NOT silently call Claude."""
+    """Single-provider mode with no items raises RuntimeError."""
     empty = OCRResult(lines=[], provider="rapid", latency_ms=1, image_size=(10, 10))
     monkeypatch.setattr(F, "rapid_ocr", lambda b: empty)
-    with pytest.raises(RuntimeError, match="returned no lines|returned no items"):
+    with pytest.raises(RuntimeError, match="returned no lines"):
         P.extract_from_image(b"\x00", "image/jpeg", provider="rapid")
 
 
-def test_extract_provider_default_is_claude(stub_db, monkeypatch):
-    """No provider arg + no env var → existing Claude path (preserves test stubs)."""
+def test_extract_provider_default_is_rapid(stub_db, monkeypatch):
+    """No provider arg + no env var → defaults to 'rapid'."""
     monkeypatch.delenv("OCR_PROVIDER", raising=False)
-    sentinel = P.Extracted(items=[], total_paid=None, chain_guess=None, city=None)
-    called = []
-    def fake_claude(data, media_type):
-        called.append((data, media_type))
-        return sentinel
-    monkeypatch.setattr(P, "_call_claude_on_image", fake_claude)
+    canned = _ocr([("7290000123456", (0.5, 0.2, 0.2, 0.02), 0.9),
+                   ("6.90",          (0.1, 0.205, 0.05, 0.02), 0.9)])
+    monkeypatch.setattr(F, "rapid_ocr", lambda b: canned)
     ex = P.extract_from_image(b"\x00", "image/jpeg")
-    assert ex is sentinel
-    assert called == [(b"\x00", "image/jpeg")]
+    assert len(ex.items) == 1
+    assert ex.items[0].barcode == "7290000123456"

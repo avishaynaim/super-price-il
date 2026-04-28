@@ -13,7 +13,7 @@ import { initReceipt } from "./receipt.js";
 import { initLive } from "./live.js";
 import { initScrapeStatus } from "./scrape.js";
 import { initSettings } from "./settings.js";
-import { getPrefs, onPrefsChange, setPrefs } from "./prefs.js";
+import { getPrefs, onPrefsChange, setPrefs, getProfiles, getActiveProfileId, activateProfile, saveProfile } from "./prefs.js";
 
 // ---- tabs ----
 const TABS = ["search", "nl", "trends", "dashboard", "receipt", "live", "scrape"];
@@ -92,23 +92,59 @@ initLive();
 initScrapeStatus();
 initSettings();
 
-// Render a compact pref strip under the health line so saved location/radius
-// are always visible, and refresh it whenever prefs change.
+// Render the pref strip: profile chips + active pref summary.
 function renderPrefStrip() {
   const strip = document.getElementById("pref-strip");
   if (!strip) return;
-  const p = getPrefs();
+  const p        = getPrefs();
+  const profiles = getProfiles();
+  const activeId = getActiveProfileId();
+
   const bits = [];
   if (p.city) bits.push(`עיר: <b>${escapeHtml(p.city)}</b>`);
   if (p.coords && p.radius_km > 0) bits.push(`טווח: <b>${p.radius_km} ק"מ</b>`);
-  if (p.preferred_chains.length) bits.push(`רשתות: <b>${p.preferred_chains.length}</b>`);
-  if (!bits.length) { strip.hidden = true; strip.innerHTML = ""; return; }
+  if (p.preferred_chains?.length) bits.push(`רשתות: <b>${p.preferred_chains.length}</b>`);
+
+  if (!bits.length && !profiles.length) {
+    strip.hidden = true;
+    strip.innerHTML = "";
+    return;
+  }
+
+  let html = '<div class="profile-strip">';
+  for (const prof of profiles) {
+    const cls = prof.id === activeId ? " active" : "";
+    html += `<button class="profile-btn${cls}" data-id="${escapeHtml(prof.id)}">${escapeHtml(prof.name)}</button>`;
+  }
+  html += `<button class="profile-btn profile-btn-add" id="profile-save-btn" title="שמור מיקום נוכחי כפרופיל">+</button>`;
+  html += "</div>";
+
+  if (bits.length) {
+    html += `<div class="pref-summary">${bits.join(" · ")}` +
+      ` · <button class="pref-clear-inline" id="pref-strip-clear">נקה</button></div>`;
+  }
+
   strip.hidden = false;
-  strip.innerHTML = bits.join(" · ") +
-    ' · <button class="pref-clear-inline" id="pref-strip-clear">נקה</button>';
-  document.getElementById("pref-strip-clear")?.addEventListener("click", () => setPrefs({
-    city: null, coords: null, radius_km: 0, preferred_chains: []
-  }));
+  strip.innerHTML = html;
+
+  strip.querySelectorAll(".profile-btn[data-id]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const prof = getProfiles().find(pr => pr.id === btn.dataset.id);
+      if (prof) activateProfile(prof);
+    });
+  });
+
+  document.getElementById("profile-save-btn")?.addEventListener("click", () => {
+    const name = prompt("שם הפרופיל (למשל: בית, עבודה, הורים):");
+    if (name?.trim()) {
+      saveProfile(name.trim());
+      toast(`פרופיל "${name.trim()}" נשמר`, "ok");
+    }
+  });
+
+  document.getElementById("pref-strip-clear")?.addEventListener("click", () =>
+    setPrefs({ city: null, coords: null, radius_km: 0, preferred_chains: [] })
+  );
 }
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({

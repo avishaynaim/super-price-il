@@ -94,15 +94,44 @@ CREATE TABLE IF NOT EXISTS receipt_items (
 );
 CREATE INDEX IF NOT EXISTS idx_ri_receipt ON receipt_items(receipt_id);
 
+CREATE TABLE IF NOT EXISTS promotions (
+    id             SERIAL PRIMARY KEY,
+    chain_id       INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
+    store_id       INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    promo_code     TEXT NOT NULL,
+    description    TEXT,
+    starts_at      TIMESTAMPTZ,
+    ends_at        TIMESTAMPTZ,
+    reward_type    TEXT,
+    min_qty        REAL,
+    discount_price REAL,
+    discount_rate  REAL,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (chain_id, store_id, promo_code)
+);
+CREATE INDEX IF NOT EXISTS idx_promo_chain ON promotions(chain_id);
+CREATE INDEX IF NOT EXISTS idx_promo_store ON promotions(store_id);
+CREATE INDEX IF NOT EXISTS idx_promo_end   ON promotions(ends_at);
+
+CREATE TABLE IF NOT EXISTS promotion_items (
+    promotion_id INTEGER NOT NULL REFERENCES promotions(id) ON DELETE CASCADE,
+    barcode      TEXT    NOT NULL,
+    product_id   INTEGER REFERENCES products(id) ON DELETE SET NULL,
+    PRIMARY KEY (promotion_id, barcode)
+);
+CREATE INDEX IF NOT EXISTS idx_pi_barcode ON promotion_items(barcode);
+
 -- ── disable RLS so the anon key can INSERT ────────────────────
 
-ALTER TABLE chains         DISABLE ROW LEVEL SECURITY;
-ALTER TABLE stores         DISABLE ROW LEVEL SECURITY;
-ALTER TABLE products       DISABLE ROW LEVEL SECURITY;
-ALTER TABLE current_prices DISABLE ROW LEVEL SECURITY;
-ALTER TABLE scrape_runs    DISABLE ROW LEVEL SECURITY;
-ALTER TABLE receipts       DISABLE ROW LEVEL SECURITY;
-ALTER TABLE receipt_items  DISABLE ROW LEVEL SECURITY;
+ALTER TABLE chains           DISABLE ROW LEVEL SECURITY;
+ALTER TABLE stores           DISABLE ROW LEVEL SECURITY;
+ALTER TABLE products         DISABLE ROW LEVEL SECURITY;
+ALTER TABLE current_prices   DISABLE ROW LEVEL SECURITY;
+ALTER TABLE scrape_runs      DISABLE ROW LEVEL SECURITY;
+ALTER TABLE receipts         DISABLE ROW LEVEL SECURITY;
+ALTER TABLE receipt_items    DISABLE ROW LEVEL SECURITY;
+ALTER TABLE promotions       DISABLE ROW LEVEL SECURITY;
+ALTER TABLE promotion_items  DISABLE ROW LEVEL SECURITY;
 
 -- ── stored procedures ─────────────────────────────────────────
 

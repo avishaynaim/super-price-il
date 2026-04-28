@@ -67,7 +67,25 @@ def top_spread(
 
 @stats_router.get("/recent-promotions")
 def recent_promotions(limit: int = Query(20, le=100)):
-    return []
+    from ..db.pg import cursor as _cursor
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT ch.code AS chain_code, ch.name_he AS chain_name_he,
+                   p.description, p.discount_price, p.discount_rate,
+                   p.starts_at, p.ends_at, p.reward_type,
+                   COUNT(pi.barcode) AS items
+            FROM promotions p
+            JOIN chains ch ON ch.id = p.chain_id
+            LEFT JOIN promotion_items pi ON pi.promotion_id = p.id
+            WHERE p.ends_at IS NULL OR p.ends_at >= NOW()
+            GROUP BY p.id, ch.code, ch.name_he
+            ORDER BY p.updated_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 @stats_router.get("/cities")
@@ -83,7 +101,23 @@ def cities_stats():
 
 @stats_router.get("/promo-counts")
 def promo_counts():
-    return []
+    from ..db.pg import cursor as _cursor
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT ch.code AS chain_code, ch.name_he AS chain_name_he,
+                   COUNT(DISTINCT p.id) AS active_promos,
+                   COUNT(pi.barcode)    AS items
+            FROM chains ch
+            LEFT JOIN promotions p ON p.chain_id = ch.id
+                AND (p.ends_at IS NULL OR p.ends_at >= NOW())
+            LEFT JOIN promotion_items pi ON pi.promotion_id = p.id
+            WHERE ch.active = TRUE
+            GROUP BY ch.id, ch.code, ch.name_he
+            ORDER BY active_promos DESC
+            """
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 @stats_router.get("/retailers-status")

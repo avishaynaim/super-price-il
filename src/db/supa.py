@@ -336,6 +336,193 @@ def delete_chain_current_prices(chain_id: int) -> None:
         cur.execute("DELETE FROM current_prices WHERE chain_id = %s", (chain_id,))
 
 
+# ---------- cache refresh ----------
+
+def refresh_caches(chain_id: int | None = None) -> None:
+    """Refresh chain_stats_cache and store_prices_cache.
+    If chain_id is given, refreshes only that chain (fast post-scrape).
+    If None, refreshes everything (full rebuild)."""
+    where = "WHERE chain_id = %s" if chain_id is not None else ""
+    params_chain = (chain_id,) if chain_id is not None else ()
+
+    with cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO chain_stats_cache (chain_id, total_prices, uniq_prods, stores_covered, updated_at)
+            SELECT chain_id, COUNT(*), COUNT(DISTINCT product_id), COUNT(DISTINCT store_id), NOW()
+            FROM current_prices {where}
+            GROUP BY chain_id
+            ON CONFLICT (chain_id) DO UPDATE SET
+                total_prices   = EXCLUDED.total_prices,
+                uniq_prods     = EXCLUDED.uniq_prods,
+                stores_covered = EXCLUDED.stores_covered,
+                updated_at     = EXCLUDED.updated_at
+            """,
+            params_chain,
+        )
+        cur.execute(
+            f"""
+            INSERT INTO store_prices_cache (chain_id, store_id, prices, last_priced)
+            SELECT chain_id, store_id, COUNT(*)::INTEGER, MAX(updated_at)
+            FROM current_prices {where}
+            GROUP BY chain_id, store_id
+            ON CONFLICT (chain_id, store_id) DO UPDATE SET
+                prices      = EXCLUDED.prices,
+                last_priced = EXCLUDED.last_priced
+            """,
+            params_chain,
+        )
+
+
+# ---------- promotions ----------
+
+_TS_FMTS = (
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M", "%Y%m%d%H%M%S", "%Y%m%d%H%M",
+    "%d/%m/%Y %H:%M", "%Y-%m-%d",
+)
+
+
+def _parse_ts(s: str | None) -> str | None:
+    if not s:
+        return None
+    from datetime import datetime as _dt
+    for fmt in _TS_FMTS:
+        try:
+            return _dt.strptime(s[:len(fmt)], fmt).isoformat()
+        except Exception:
+            pass
+    return s
+
+
+def upsert_promotions(
+    chain_id: int,
+    store_id: int | None,
+    rows: list[Any],
+    product_cache: dict[str, int],
+) -> int:
+    """Upsert PromoRow objects into promotions + promotion_items.
+
+    Uses 3 bulk queries instead of per-row inserts:
+      1. execute_values to upsert all promotions
+      2. SELECT to get back their IDs
+      3. execute_values to upsert all promotion_items
+    """
+    if not rows:
+        return 0
+
+    conn = connect()
+    conn.autocommit = True
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 1. Bulk upsert promotions
+            promo_vals = [
+                (
+                    chain_id, store_id, r.promo_code, r.description,
+                    _parse_ts(r.starts_at), _parse_ts(r.ends_at),
+                    r.reward_type, r.min_qty, r.discount_price, r.discount_rate,
+                )
+                for r in rows
+            ]
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO promotions
+                    (chain_id, store_id, promo_code, description,
+                     starts_at, ends_at, reward_type, min_qty,
+                     discount_price, discount_rate, updated_at)
+                VALUES %s
+                ON CONFLICT (chain_id, store_id, promo_code) DO UPDATE SET
+                    description    = EXCLUDED.description,
+                    starts_at      = EXCLUDED.starts_at,
+                    ends_at        = EXCLUDED.ends_at,
+                    reward_type    = EXCLUDED.reward_type,
+                    min_qty        = EXCLUDED.min_qty,
+                    discount_price = EXCLUDED.discount_price,
+                    discount_rate  = EXCLUDED.discount_rate,
+                    updated_at     = NOW()
+                """,
+                [(v + (datetime.now(timezone.utc).isoformat(),)) for v in promo_vals],
+                page_size=500,
+            )
+
+            # 2. Fetch IDs for all upserted promotions
+            codes = [r.promo_code for r in rows]
+            cur.execute(
+                "SELECT id, promo_code FROM promotions "
+                "WHERE chain_id=%s AND store_id IS NOT DISTINCT FROM %s AND promo_code=ANY(%s)",
+                (chain_id, store_id, codes),
+            )
+            id_map = {r["promo_code"]: r["id"] for r in cur.fetchall()}
+
+            # 3. Bulk upsert promotion_items for all promos that have barcodes
+            pi_vals = [
+                (id_map[r.promo_code], bc, product_cache.get(bc))
+                for r in rows
+                if r.promo_code in id_map
+                for bc in r.item_barcodes
+            ]
+            if pi_vals:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    INSERT INTO promotion_items (promotion_id, barcode, product_id)
+                    VALUES %s
+                    ON CONFLICT (promotion_id, barcode) DO NOTHING
+                    """,
+                    pi_vals,
+                    page_size=1000,
+                )
+
+    finally:
+        conn.close()
+    return len(rows)
+
+
+def get_promotions_for_barcode(
+    barcode: str,
+    chain_ids: list[int] | None = None,
+    city_spellings: list[str] | None = None,
+    active_only: bool = True,
+) -> list[dict]:
+    where = ["pi.barcode = %s"]
+    params: list[Any] = [barcode]
+    if active_only:
+        where.append("(p.ends_at IS NULL OR p.ends_at >= NOW())")
+    if chain_ids:
+        where.append("p.chain_id = ANY(%s)")
+        params.append(chain_ids)
+    if city_spellings:
+        where.append("(p.store_id IS NULL OR s.city = ANY(%s))")
+        params.append(city_spellings)
+    sql = f"""
+        SELECT
+            ch.code            AS chain_code,
+            ch.name_he         AS chain_name_he,
+            p.store_id,
+            s.name             AS store_name,
+            s.city             AS store_city,
+            p.promo_code,
+            p.description,
+            p.starts_at,
+            p.ends_at,
+            p.reward_type,
+            p.min_qty,
+            p.discount_price,
+            p.discount_rate
+        FROM promotion_items pi
+        JOIN promotions p  ON p.id       = pi.promotion_id
+        JOIN chains     ch ON ch.id      = p.chain_id
+        LEFT JOIN stores s ON s.id       = p.store_id
+        WHERE {' AND '.join(where)}
+        ORDER BY p.ends_at NULLS LAST, ch.name_he
+        LIMIT 200
+    """
+    with cursor() as cur:
+        cur.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
+
+
 # ---------- scrape_runs ----------
 
 def scrape_run_start(chain_id: int) -> int:

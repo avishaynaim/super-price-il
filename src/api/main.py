@@ -247,7 +247,16 @@ def trends(barcode: str, days: int = Query(7, ge=1, le=90)):
 def promotions(barcode: str, chain: str | None = None, chains: str | None = None,
                city: str | None = None, lat: float | None = None,
                lng: float | None = None, radius_km: float | None = Query(None)):
-    return []
+    from .geo import compute_city_spellings
+    from ..db.pg import cursor as _cursor
+    chain_codes = _resolve_chain_codes(chain, chains)
+    chain_ids: list[int] | None = None
+    if chain_codes:
+        with _cursor() as cur:
+            cur.execute("SELECT id FROM chains WHERE code = ANY(%s)", (chain_codes,))
+            chain_ids = [r["id"] for r in cur.fetchall()]
+    city_spellings = compute_city_spellings(city, lat, lng, radius_km)
+    return supa.get_promotions_for_barcode(barcode, chain_ids, city_spellings)
 
 
 # ---------- helpers ----------

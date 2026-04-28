@@ -13,7 +13,8 @@ import typer
 from rich.console import Console
 
 from ..db import supa
-from ..parser import pricefull, stores as stores_parser
+from ..parser import pricefull, promofull, stores as stores_parser
+from ..scraper.base import RAW_ROOT
 from ..scraper.chains.shufersal import ShufersalScraper
 from ..scraper.chains.publishedprices import (
     PublishedPricesScraper,
@@ -112,6 +113,29 @@ NEEDS_INSECURE = (
 )
 
 
+def _stores_stale_chains(chains: list[str], stale_days: int) -> list[str]:
+    """Return chains where no Stores/StoresFull file exists in data/raw/ within stale_days."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=stale_days)
+    stale = []
+    for code in chains:
+        chain_raw = RAW_ROOT / code
+        if not chain_raw.exists():
+            stale.append(code)
+            continue
+        latest: datetime | None = None
+        for day_dir in chain_raw.iterdir():
+            if not day_dir.is_dir():
+                continue
+            for f in day_dir.iterdir():
+                if f.name.lower().startswith(("stores", "storefull")):
+                    mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+                    if latest is None or mtime > latest:
+                        latest = mtime
+        if latest is None or latest < cutoff:
+            stale.append(code)
+    return stale
+
+
 def _filter_overdue(chains: list[str], threshold_days: int) -> list[str]:
     """Drop chains that finished a successful scrape within `threshold_days`."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=threshold_days)).isoformat(timespec="seconds")
@@ -194,10 +218,15 @@ async def run_chain(
         except Exception:
             pass
 
+    STORE_KINDS = {"Stores", "StoresFull"}
+    # Stores files are published infrequently; always fetch all of them
+    # regardless of the date window when doing a stores-only run.
+    effective_since = None if (kinds and kinds <= STORE_KINDS) else since
+
     async with client_cm as client:
         scraper = scraper_cls(spec, client)
         files = await scraper.run(
-            since=since, limit=limit, kinds=kinds,
+            since=effective_since, limit=limit, kinds=kinds,
             on_listed=_on_listed, on_downloaded=_on_downloaded,
         )
 
@@ -225,6 +254,13 @@ async def run_chain(
                 rows_written += supa.insert_observations(
                     chain_id, store_id, rows, str(df.path), product_cache
                 )
+            elif df.remote.kind in {"PromoFull", "Promo"}:
+                header, promo_rows = promofull.parse(df.xml_bytes)
+                store_code = df.remote.store_code or header.store_id
+                store_id = supa.get_or_create_store_by_code(chain_id, store_code) if store_code else None
+                rows_written += supa.upsert_promotions(
+                    chain_id, store_id, list(promo_rows), product_cache
+                )
             files_ok += 1
         except Exception as e:
             console.print(f"[red]{df.remote.filename}: {e}[/red]")
@@ -240,6 +276,11 @@ async def run_chain(
 
     status = "ok" if files_failed == 0 else "partial"
     supa.scrape_run_finish(run_id, status, files_ok, files_failed, rows_written)
+    # Refresh dashboard cache tables for this chain only (fast — <1s per chain).
+    try:
+        supa.refresh_caches(chain_id)
+    except Exception as e:
+        console.print(f"[dim]cache refresh skipped: {e}[/dim]")
     return files_ok, rows_written
 
 
@@ -256,6 +297,11 @@ def main(
         help="skip chains whose last successful scrape finished within N days "
              "(0 = always scrape; weekly cron uses 7).",
     ),
+    refresh_stores_days: int = typer.Option(
+        7,
+        help="also do a stores-only pass for chains whose last Stores file is "
+             "older than N days (0 = disabled).",
+    ),
 ) -> None:
     # Seed chains into Supabase on every run (idempotent upsert).
     from ..scraper.registry import CHAINS as _CHAINS
@@ -268,6 +314,23 @@ def main(
 
     if skip_recent > 0:
         chains = _filter_overdue(chains, skip_recent)
+
+    STORE_KINDS = {"Stores", "StoresFull"}
+    is_stores_only = bool(kind_set and kind_set <= STORE_KINDS)
+
+    # Auto stores-refresh: before price runs, do a stores-only pass for
+    # chains whose last Stores file is older than refresh_stores_days.
+    if refresh_stores_days > 0 and not is_stores_only:
+        stale = _stores_stale_chains(chains, refresh_stores_days)
+        if stale:
+            console.print(
+                f"[dim]stores refresh for {len(stale)} stale chain(s): "
+                f"{', '.join(stale)}[/dim]"
+            )
+            for c in stale:
+                console.rule(f"[dim]{c} (stores refresh)")
+                files_ok, _ = asyncio.run(run_chain(c, since, cap, STORE_KINDS))
+                console.print(f"{c} stores: files_ok={files_ok}")
 
     for c in chains:
         console.rule(f"[bold]{c}")

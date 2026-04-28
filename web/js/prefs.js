@@ -84,9 +84,74 @@ export function prefsQuery({ includeCity = true, includeChain = false } = {}) {
   return q;
 }
 
+// ── Location profiles ────────────────────────────────────────────────────────
+// Stored in "superprice:profiles" as an array of:
+//   { id, name, city, coords, radius_km, preferred_chains }
+// The active profile id is tracked in "superprice:active_profile".
+
+const PROFILES_KEY = "superprice:profiles";
+const ACTIVE_KEY   = "superprice:active_profile";
+
+export function getProfiles() {
+  try {
+    const s = localStorage.getItem(PROFILES_KEY);
+    if (!s) return [];
+    const a = JSON.parse(s);
+    return Array.isArray(a) ? a : [];
+  } catch { return []; }
+}
+
+function writeProfiles(arr) {
+  try { localStorage.setItem(PROFILES_KEY, JSON.stringify(arr)); } catch {}
+}
+
+export function getActiveProfileId() {
+  return localStorage.getItem(ACTIVE_KEY) || null;
+}
+
+function setActiveProfileId(id) {
+  try {
+    if (id) localStorage.setItem(ACTIVE_KEY, id);
+    else localStorage.removeItem(ACTIVE_KEY);
+  } catch {}
+}
+
+export function saveProfile(name) {
+  const p = getPrefs();
+  const id = "p" + Date.now();
+  const profiles = getProfiles();
+  profiles.push({
+    id, name,
+    city: p.city || null,
+    coords: p.coords || null,
+    radius_km: p.radius_km || 0,
+    preferred_chains: [...(p.preferred_chains || [])],
+  });
+  writeProfiles(profiles);
+  setActiveProfileId(id);
+  emit();
+  return id;
+}
+
+export function deleteProfile(id) {
+  writeProfiles(getProfiles().filter(p => p.id !== id));
+  if (getActiveProfileId() === id) setActiveProfileId(null);
+  emit();
+}
+
+export function activateProfile(profile) {
+  setActiveProfileId(profile.id);
+  setPrefs({
+    city: profile.city || null,
+    coords: profile.coords || null,
+    radius_km: profile.radius_km || 0,
+    preferred_chains: profile.preferred_chains || [],
+  });
+}
+
 // Cross-tab sync (another tab writes → we update)
 window.addEventListener("storage", e => {
-  if (e.key !== KEY) return;
+  if (e.key !== KEY && e.key !== PROFILES_KEY && e.key !== ACTIVE_KEY) return;
   cached = null;
   emit();
 });

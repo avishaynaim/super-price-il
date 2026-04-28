@@ -22,10 +22,13 @@ PYTHON="${PYTHON:-python3}"
 cd "$REPO_ROOT"
 
 echo "[$(date -u +%FT%TZ)] super-price-il daily backfill starting"
-# --retain 0   ⇒ read from data/settings.json (retention_days)
-# --skip-recent 7 ⇒ weekly cadence per chain — anything scraped within 7 days
-#                   is a no-op; anything older runs immediately.
+# --kinds PriceFull,PromoFull — prices + promotions daily.
+# --refresh-stores-days 7    — automatically adds Stores/StoresFull for chains
+#                              whose store files are older than 7 days.
+# Cache tables (chain_stats_cache, store_prices_cache) are refreshed per-chain
+# automatically inside backfill.py after each scrape run.
 "$PYTHON" -m src.cli.backfill \
-    --chain all --days 1 --retain 0 --skip-recent 7 \
-    --kinds PriceFull,Stores,StoresFull
+    --chain all --days 1 \
+    --kinds PriceFull,PromoFull \
+    --refresh-stores-days 7
 echo "[$(date -u +%FT%TZ)] super-price-il daily backfill done"

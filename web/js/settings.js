@@ -2,7 +2,7 @@
 // Trigger: gear button in the header ("btn-settings").
 
 import { api } from "./api.js";
-import { getPrefs, setPrefs, clearPrefs } from "./prefs.js";
+import { getPrefs, setPrefs, clearPrefs, getProfiles, saveProfile, deleteProfile, activateProfile, getActiveProfileId } from "./prefs.js";
 import { escapeHtml, toast } from "./ui.js";
 
 const modal     = () => document.getElementById("settings-modal");
@@ -22,6 +22,54 @@ const retentionLbl = () => document.getElementById("pref-retention-label");
 let lastFocus = null;
 let citiesLoaded = false;
 
+function renderProfilesList() {
+  const el = document.getElementById("pref-profiles-list");
+  if (!el) return;
+  const profiles = getProfiles();
+  const activeId = getActiveProfileId();
+  if (!profiles.length) {
+    el.innerHTML = '<div class="hint">אין פרופילים שמורים עדיין.</div>';
+    return;
+  }
+  el.innerHTML = profiles.map(prof => {
+    const meta = [prof.city, prof.radius_km > 0 ? `${prof.radius_km} ק"מ` : null,
+      prof.preferred_chains?.length ? `${prof.preferred_chains.length} רשתות` : null]
+      .filter(Boolean).join(", ") || "ללא סינון";
+    const isActive = prof.id === activeId;
+    return `<div class="profile-list-row">
+      <span class="profile-name">${escapeHtml(prof.name)}${isActive ? ' <span style="color:var(--accent-2);font-size:11px">(פעיל)</span>' : ""}</span>
+      <span class="profile-meta">${escapeHtml(meta)}</span>
+      <button type="button" class="btn-secondary" style="padding:3px 8px;font-size:12px" data-activate="${escapeHtml(prof.id)}">טען</button>
+      <button type="button" class="link" style="color:var(--err);font-size:12px" data-delete="${escapeHtml(prof.id)}">מחק</button>
+    </div>`;
+  }).join("");
+  el.querySelectorAll("[data-activate]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const prof = getProfiles().find(p => p.id === btn.dataset.activate);
+      if (prof) {
+        activateProfile(prof);
+        const p2 = getPrefs();
+        cityInput().value = p2.city || "";
+        radiusIn().value  = String(p2.radius_km || 0);
+        updateRadiusLabel();
+        renderGeoStatus();
+        renderProfilesList();
+        toast(`פרופיל "${prof.name}" נטען`, "ok");
+      }
+    });
+  });
+  el.querySelectorAll("[data-delete]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const prof = getProfiles().find(p => p.id === btn.dataset.delete);
+      if (prof && confirm(`למחוק את הפרופיל "${prof.name}"?`)) {
+        deleteProfile(prof.id);
+        renderProfilesList();
+        toast(`פרופיל "${prof.name}" נמחק`, "ok");
+      }
+    });
+  });
+}
+
 function openModal() {
   lastFocus = document.activeElement;
   const p = getPrefs();
@@ -32,6 +80,7 @@ function openModal() {
   ensureCitiesLoaded();
   ensureChainsLoaded(p.preferred_chains);
   loadRetention();
+  renderProfilesList();
   modal().classList.remove("hidden");
   modal().hidden = false;
   setTimeout(() => cityInput().focus(), 40);
@@ -181,6 +230,15 @@ export function initSettings() {
       closeModal();
       toast("ההעדפות נוקו", "ok");
     }
+  });
+  document.getElementById("pref-save-profile")?.addEventListener("click", () => {
+    const nameEl = document.getElementById("pref-new-profile-name");
+    const name = nameEl?.value.trim();
+    if (!name) { toast("הזן שם לפרופיל", "warn"); return; }
+    saveProfile(name);
+    if (nameEl) nameEl.value = "";
+    renderProfilesList();
+    toast(`פרופיל "${name}" נשמר`, "ok");
   });
   // click-outside to close
   modal()?.addEventListener("click", e => { if (e.target === modal()) closeModal(); });
