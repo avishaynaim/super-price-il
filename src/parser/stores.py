@@ -23,14 +23,23 @@ class StoreRow:
     store_type: str | None
 
 
-_CITIES_FILE = Path(__file__).resolve().parents[2] / "data" / "il_cities.json"
+_CITIES_FILE      = Path(__file__).resolve().parents[2] / "data" / "il_cities.json"
+_CITY_CODES_FILE  = Path(__file__).resolve().parents[2] / "data" / "il_city_codes.json"
 _NUMERIC_RE = re.compile(r"^\d{1,7}$")
 
 
 @lru_cache(maxsize=1)
+def _city_codes() -> dict[str, str]:
+    """CBS settlement-code → Hebrew name from data/il_city_codes.json."""
+    try:
+        return json.loads(_CITY_CODES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+@lru_cache(maxsize=1)
 def _known_cities() -> list[str]:
-    """Hebrew canonical city names from data/il_cities.json, longest-first
-    so 'תל אביב יפו' wins over 'תל אביב' when matching against a store name."""
+    """Hebrew canonical city names from data/il_cities.json, longest-first."""
     try:
         data = json.loads(_CITIES_FILE.read_text())
     except Exception:
@@ -46,8 +55,7 @@ def _known_cities() -> list[str]:
 
 
 def _city_from_name(store_name: str | None) -> str | None:
-    """Carrefour publishes postal codes in <City>; extract a Hebrew city from
-    the store name as a fallback. We scan the name for any known city string."""
+    """Extract a Hebrew city from the store name as last-resort fallback."""
     if not store_name:
         return None
     for city in _known_cities():
@@ -57,11 +65,22 @@ def _city_from_name(store_name: str | None) -> str | None:
 
 
 def _normalize_city(raw_city: str | None, store_name: str | None) -> str | None:
-    """If <City> is purely numeric (postal code), try the store name; else
-    return <City> as-is. Empty strings collapse to None."""
-    if raw_city and not _NUMERIC_RE.match(raw_city.strip()):
-        return raw_city.strip()
-    return _city_from_name(store_name)
+    """Resolve <City> to a Hebrew name.
+
+    Priority:
+      1. Already a Hebrew string → return as-is.
+      2. Numeric → look up in CBS settlement-code table (il_city_codes.json).
+      3. Fallback → scan store name for a known city string.
+    """
+    if not raw_city:
+        return _city_from_name(store_name)
+    stripped = raw_city.strip()
+    if not _NUMERIC_RE.match(stripped):
+        return stripped or _city_from_name(store_name)
+    # Numeric code — try exact, then without leading zeros
+    codes = _city_codes()
+    name = codes.get(stripped) or codes.get(stripped.lstrip("0") or "0")
+    return name or _city_from_name(store_name)
 
 
 def parse(xml_bytes: bytes) -> Iterator[StoreRow]:

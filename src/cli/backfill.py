@@ -223,12 +223,18 @@ async def run_chain(
     # regardless of the date window when doing a stores-only run.
     effective_since = None if (kinds and kinds <= STORE_KINDS) else since
 
-    async with client_cm as client:
-        scraper = scraper_cls(spec, client)
-        files = await scraper.run(
-            since=effective_since, limit=limit, kinds=kinds,
-            on_listed=_on_listed, on_downloaded=_on_downloaded,
-        )
+    try:
+        async with client_cm as client:
+            scraper = scraper_cls(spec, client)
+            files = await scraper.run(
+                since=effective_since, limit=limit, kinds=kinds,
+                on_listed=_on_listed, on_downloaded=_on_downloaded,
+            )
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        console.print(f"[red]{code}: scrape failed — {msg}[/red]")
+        supa.scrape_run_finish(run_id, "error", 0, 0, 0, error_msg=msg)
+        return (0, 0)
 
     # Wipe this chain's previous prices before inserting fresh ones (1-day retention).
     supa.delete_chain_current_prices(chain_id)
@@ -329,13 +335,19 @@ def main(
             )
             for c in stale:
                 console.rule(f"[dim]{c} (stores refresh)")
-                files_ok, _ = asyncio.run(run_chain(c, since, cap, STORE_KINDS))
-                console.print(f"{c} stores: files_ok={files_ok}")
+                try:
+                    files_ok, _ = asyncio.run(run_chain(c, since, cap, STORE_KINDS))
+                    console.print(f"{c} stores: files_ok={files_ok}")
+                except Exception as exc:
+                    console.print(f"[yellow]{c} stores refresh failed ({exc}), skipping[/yellow]")
 
     for c in chains:
         console.rule(f"[bold]{c}")
-        files_ok, rows = asyncio.run(run_chain(c, since, cap, kind_set))
-        console.print(f"{c}: files_ok={files_ok} rows={rows}")
+        try:
+            files_ok, rows = asyncio.run(run_chain(c, since, cap, kind_set))
+            console.print(f"{c}: files_ok={files_ok} rows={rows}")
+        except Exception as exc:
+            console.print(f"[red]{c}: unexpected error — {exc}[/red]")
 
     if not no_prune:
         from .prune import prune

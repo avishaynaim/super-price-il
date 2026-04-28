@@ -22,7 +22,9 @@ from ..db import supa
 
 geo_router = APIRouter(tags=["geo"])
 
-_DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "data", "il_cities.json")
+_DATA_PATH       = os.path.join(os.path.dirname(__file__), "..", "..", "data", "il_cities.json")
+_CODES_PATH      = os.path.join(os.path.dirname(__file__), "..", "..", "data", "il_city_codes.json")
+_NUMERIC_CITY_RE = __import__("re").compile(r"^\d{1,7}$")
 
 
 @lru_cache(maxsize=1)
@@ -32,14 +34,29 @@ def _load_cities() -> list[dict]:
 
 
 @lru_cache(maxsize=1)
+def _load_city_codes() -> dict[str, str]:
+    """CBS settlement code (str) → Hebrew city name."""
+    try:
+        with open(_CODES_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+@lru_cache(maxsize=1)
 def _alias_to_canonical() -> dict[str, str]:
-    """Map every known spelling (canonical + aliases) → canonical name."""
+    """Map every known spelling (canonical + aliases) → canonical name.
+    Also maps CBS numeric codes → canonical name."""
     m: dict[str, str] = {}
     for c in _load_cities():
         name = c["name_he"]
         m[name] = name
         for a in c.get("aliases", []):
             m[a] = name
+    # Numeric CBS codes resolve to the CBS name (may not match exactly, that's OK)
+    for code, name in _load_city_codes().items():
+        if code not in m:
+            m[code] = name
     return m
 
 
@@ -205,13 +222,11 @@ def city_filter_sql(
 @geo_router.get("/cities")
 def list_cities(with_stores_only: bool = Query(True, description="only cities that actually have stores")):
     """Full city picker. Merges the bundled coord data with DB store counts.
-
-    When with_stores_only=True (default), returns only canonical cities that have
-    at least one store in the DB (sum across aliases). When False, includes every
-    city in the bundle — useful if we later add stores.
+    Sorted alphabetically; numeric CBS codes are resolved to Hebrew names.
     """
     coords = _coords_by_canonical()
     alias_map = _alias_to_canonical()
+    codes_map = _load_city_codes()
 
     # Pull distinct cities from Supabase
     res = supa.sb().table("stores").select("city").not_.is_("city", "null").execute()
@@ -220,31 +235,32 @@ def list_cities(with_stores_only: bool = Query(True, description="only cities th
         raw = (r.get("city") or "").strip()
         if not raw:
             continue
+        # Skip purely numeric values that haven't been re-normalised yet
+        if _NUMERIC_CITY_RE.match(raw):
+            resolved = codes_map.get(raw) or codes_map.get(raw.lstrip("0") or "0")
+            if not resolved:
+                continue
+            raw = resolved
         canonical = alias_map.get(raw, raw)
         counts[canonical] = counts.get(canonical, 0) + 1
 
-    # assemble result
+    # Assemble: start from the bundled coords list (gives us lat/lng)
     out = []
-    seen = set()
+    seen: set[str] = set()
     for c in _load_cities():
         name = c["name_he"]
         seen.add(name)
         stores = counts.get(name, 0)
         if with_stores_only and stores == 0:
             continue
-        out.append({
-            "name_he": name,
-            "lat": float(c["lat"]),
-            "lng": float(c["lng"]),
-            "stores": stores,
-        })
+        out.append({"name_he": name, "lat": float(c["lat"]), "lng": float(c["lng"]), "stores": stores})
 
-    # cities present in DB but not in the bundle — include without coords
+    # Cities present in DB but not in the bundle — include without coords
     for name, n in counts.items():
         if name not in seen:
             out.append({"name_he": name, "lat": None, "lng": None, "stores": n})
 
-    out.sort(key=lambda x: (-x["stores"], x["name_he"]))
+    out.sort(key=lambda x: x["name_he"])
     return out
 
 

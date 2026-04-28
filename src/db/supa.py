@@ -411,6 +411,13 @@ def upsert_promotions(
     if not rows:
         return 0
 
+    # Deduplicate by promo_code — keep last occurrence so duplicate codes within
+    # one file don't cause "ON CONFLICT DO UPDATE cannot affect same row twice".
+    seen_codes: dict[str, Any] = {}
+    for r in rows:
+        seen_codes[r.promo_code] = r
+    rows = list(seen_codes.values())
+
     conn = connect()
     conn.autocommit = True
     try:

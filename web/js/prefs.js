@@ -118,8 +118,20 @@ function setActiveProfileId(id) {
 
 export function saveProfile(name) {
   const p = getPrefs();
-  const id = "p" + Date.now();
   const profiles = getProfiles();
+  // Update existing profile with same name instead of creating a duplicate
+  const existing = profiles.find(pr => pr.name === name);
+  if (existing) {
+    existing.city = p.city || null;
+    existing.coords = p.coords || null;
+    existing.radius_km = p.radius_km || 0;
+    existing.preferred_chains = [...(p.preferred_chains || [])];
+    writeProfiles(profiles);
+    setActiveProfileId(existing.id);
+    emit();
+    return existing.id;
+  }
+  const id = "p" + Date.now();
   profiles.push({
     id, name,
     city: p.city || null,
