@@ -54,13 +54,9 @@ async function sbDispatch(path, query = {}, init = {}) {
 
   // GET /api/health
   if (path === "/api/health") {
-    const [chains_active, stores, products, current_prices] = await Promise.all([
-      sbCount("chains", { "active": "eq.true" }),
-      sbCount("stores"),
-      sbCount("products"),
-      sbCount("current_prices"),
-    ]);
-    return { status: "ok", chains_active, stores, products, current_prices };
+    const rows = await sbRpc("quick_stats");
+    const s = rows[0] || {};
+    return { status: "ok", chains_active: s.chains_active, stores: s.stores, products: s.products, current_prices: s.current_prices };
   }
 
   // GET /api/chains
@@ -150,9 +146,16 @@ async function sbDispatch(path, query = {}, init = {}) {
   // GET /api/stats/recent-promotions
   if (path === "/api/stats/recent-promotions") return [];
 
+  // GET /api/stats/chain-stores/:code
+  const chainStoresM = path.match(/^\/api\/stats\/chain-stores\/(.+)$/);
+  if (chainStoresM) {
+    const rows = await sbRpc("get_chain_stores", { p_code: chainStoresM[1] });
+    return rows[0] || { chain: null, totals: {}, stores: [] };
+  }
+
   // GET /api/stats/cities
   if (path === "/api/stats/cities") {
-    const rows = await sbGet("stores", { "select": "city", "not.city": "is.null", "limit": "5000" });
+    const rows = await sbGet("stores", { "select": "city", "city": "not.is.null", "limit": "5000" });
     const counts = {};
     for (const r of rows) {
       const c = (r.city || "").trim();
