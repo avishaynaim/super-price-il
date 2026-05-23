@@ -54,6 +54,10 @@ function loadHealth() {
     document.getElementById("health").textContent =
       `חיבור: ${h.status} · רשתות פעילות ${h.chains_active} · חנויות ${h.stores} ` +
       `· מוצרים ${h.products.toLocaleString()} · מחירים נוכחיים ${h.current_prices.toLocaleString()}`;
+    if (h.version) {
+      const el = document.getElementById("app-version");
+      if (el) el.textContent = `v${h.version}`;
+    }
   }).catch(() => {
     document.getElementById("health").textContent = "health err";
   });
@@ -165,5 +169,4 @@ onRoute(state => {
 bootstrap();
 updateOnline();
 
-// default to search tab if no hash
-if (!location.hash) setRoute("search");
+// router.js already defaults to "scrape" for unknown/empty hash

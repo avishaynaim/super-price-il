@@ -6,7 +6,7 @@ const VALID = new Set(["search", "nl", "trends", "dashboard", "receipt", "live",
 function parse() {
   const h = location.hash.replace(/^#/, "");
   const [tab, qs] = h.split("?");
-  const id = VALID.has(tab) ? tab : "search";
+  const id = VALID.has(tab) ? tab : "scrape";
   const params = new URLSearchParams(qs || "");
   return { tab: id, params };
 }

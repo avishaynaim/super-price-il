@@ -22,12 +22,56 @@ from typing import Iterable
 
 from .free_ocr import OCRLine, OCRResult
 from .pipeline import Extracted, ExtractedItem
-from ..db.pg import cursor as _pg_cursor
 
-# Israeli EAN-13: prefix 729 + 10 digits. Prefix 729 covers Israel; some chains
-# emit 7290 (consumer) or 7296/7298 (own-brand). Allow a leading non-digit so
-# we don't false-match inside longer numbers.
+# Israeli EAN-13: prefix 729 + 10 digits. Two strategies:
+#   1. Exact: 13-digit sequence starting with 729, not surrounded by digits.
+#   2. Fuzzy: extract any 13-digit run containing 729 if exact fails —
+#      handles OCR noise that prepends/appends 1 stray digit.
 BARCODE_RE = re.compile(r"(?<!\d)(729\d{10})(?!\d)")
+BARCODE_FUZZY_RE = re.compile(r"\d*(729\d{10})\d*")
+
+
+def _normalize_barcode_text(text: str) -> str:
+    """Fix common OCR character substitutions in barcode regions.
+    Thermal paper fonts cause: 7→1, 7→T, 7→l, 0→O, 1→I, etc.
+    We only apply corrections when a 13-digit Israeli barcode is plausible.
+    """
+    # Replace characters that look like digits in OCR output
+    return (text
+            .replace("O", "0").replace("o", "0")
+            .replace("I", "1").replace("l", "1")
+            .replace("T", "7").replace("t", "7"))
+
+
+def _extract_barcodes(text: str) -> list[str]:
+    """Find all Israeli barcodes in text, with fuzzy fallback for OCR noise.
+
+    Strategy:
+    1. Exact match first.
+    2. Normalize common OCR character errors (T→7, 1→7 for prefix) and retry.
+    3. Fuzzy: look for 729x sequences and extract/reconstruct the 13-digit barcode.
+    """
+    exact = BARCODE_RE.findall(text)
+    if exact:
+        return exact
+
+    # Normalize OCR errors and retry
+    normalized = _normalize_barcode_text(text)
+    # Also fix '1290' → '7290' prefix misread (7 looks like 1 on thermal paper)
+    normalized = re.sub(r"(?<!\d)1(290\d{9})(?!\d)", r"7\1", normalized)
+    exact2 = BARCODE_RE.findall(normalized)
+    if exact2:
+        return exact2
+
+    # Fuzzy: find 729x + 9 digits even if embedded in noise
+    found = []
+    for src in (text, normalized):
+        for m in re.finditer(r"[7T1][2I][9g][0Oo]\d{9}", src):
+            candidate = _normalize_barcode_text(m.group(0))
+            candidate = re.sub(r"^1(290)", r"7\1", candidate)
+            if re.fullmatch(r"729\d{10}", candidate):
+                found.append(candidate)
+    return list(dict.fromkeys(found))  # deduplicate, preserve order
 # Loose internal codes (sometimes 6-7 digits, e.g. PLU). We use these for
 # weight items where there's no GTIN.
 INTERNAL_RE = re.compile(r"(?<!\d)(\d{6,7})(?!\d)")
@@ -56,27 +100,31 @@ def _row_x(line: OCRLine) -> float:
 
 
 def _auto_y_tol(lines: list[OCRLine]) -> float:
-    """Pick y_tol based on the median line height — adapts to scale."""
+    """Pick y_tol based on the median line height — adapts to scale.
+
+    On thermal receipts each item has: barcode line, then price line 1–1.5
+    line-heights below. We use 1.3× median height so barcodes and their
+    prices group together even when OCR splits them across adjacent rows.
+    """
     if not lines:
-        return 0.012
+        return 0.015
     heights = sorted(ln.box[3] for ln in lines)
     median = heights[len(heights) // 2]
-    # Two centers are 'same row' if within ~55% of one line height.
-    return max(0.006, min(0.025, median * 0.55))
+    return max(0.010, min(0.040, median * 1.3))
 
 
 def _group_rows(lines: list[OCRLine], y_tol: float | None = None) -> list[list[OCRLine]]:
     """Cluster lines that share approximately the same vertical center.
 
-    `y_tol` is in normalized image coords (1.0 = full height). When None,
-    we pick a value from the median line height in the input.
+    Uses the group's FIRST line as anchor so that intermediate lines don't
+    slide the window and merge separate receipt rows into one cluster.
     """
     if y_tol is None:
         y_tol = _auto_y_tol(lines)
     sorted_lines = sorted(lines, key=_row_y)
     rows: list[list[OCRLine]] = []
     for ln in sorted_lines:
-        if rows and abs(_row_y(ln) - _row_y(rows[-1][-1])) <= y_tol:
+        if rows and abs(_row_y(ln) - _row_y(rows[-1][0])) <= y_tol:
             rows[-1].append(ln)
         else:
             rows.append([ln])
@@ -87,13 +135,18 @@ def _lookup_barcodes(barcodes: Iterable[str]) -> dict[str, dict]:
     bcs = list({b for b in barcodes if b})
     if not bcs:
         return {}
-    with _pg_cursor() as cur:
-        cur.execute(
-            "SELECT barcode, name, manufacturer FROM products WHERE barcode = ANY(%s)",
-            (bcs,),
-        )
-        rows = cur.fetchall()
-    return {r["barcode"]: dict(r) for r in rows}
+    try:
+        from ..db.pg import cursor as _pg_cursor
+        with _pg_cursor() as cur:
+            cur.execute(
+                "SELECT barcode, name, manufacturer FROM products WHERE barcode = ANY(%s)",
+                (bcs,),
+            )
+            rows = cur.fetchall()
+        return {r["barcode"]: dict(r) for r in rows}
+    except Exception:
+        from ..db.local import lookup_barcodes as _local_lookup
+        return _local_lookup(bcs)
 
 
 def _row_features(row: list[OCRLine]) -> dict:
@@ -108,7 +161,7 @@ def _row_features(row: list[OCRLine]) -> dict:
     weights:  list[float] = []
     for ln in row:
         x = _row_x(ln)
-        for bc in BARCODE_RE.findall(ln.text):
+        for bc in _extract_barcodes(ln.text):
             barcodes.append((x, bc))
         for p in PRICE_RE.findall(ln.text):
             v = _to_float(p)
@@ -176,82 +229,119 @@ def _pair_prices_to_barcodes(
 
 
 def parse_ocr_to_extracted(ocr: OCRResult) -> Extracted:
-    """Turn an OCRResult into an Extracted. Only emits items where we found at
-    least a barcode or a price — junk detections are dropped.
+    """Turn an OCRResult into an Extracted.
 
-    Strategy:
-      1. Group OCR lines into rows by Y proximity (auto y_tol from line height).
-      2. Within each row, pair each barcode with its nearest-X price.
-      3. Absorb orphan rows (price-only, no barcode) into the nearest
-         barcode-bearing row above or below.
+    Strategy: sequential scan sorted by Y position.
+    1. Collect all (y, barcode) and (y, price) events from every OCR line.
+    2. Sort by Y. For each barcode, claim the nearest unclaimed price within
+       a scan window of 3 line-heights (above or below).
+    3. Barcodes resolved first; remaining prices become anonymous items.
     """
-    rows = _group_rows(ocr.lines)
+    if not ocr.lines:
+        return Extracted(items=[], total_paid=None, chain_guess=None, city=None,
+                         ai={"provider": ocr.provider, "latency_ms": ocr.latency_ms,
+                             "ocr_lines": 0, "image_size": list(ocr.image_size)})
 
-    # First pass: lookup barcodes once.
+    y_tol = _auto_y_tol(ocr.lines)
+    scan_window = y_tol * 3  # look up to 3 line-heights away for a price
+
+    # --- collect all barcodes and prices with positions ---
+    bc_events:    list[tuple[float, str, str]] = []   # (y, barcode, raw_line)
+    price_events: list[tuple[float, float, str]] = [] # (y, value, raw_line)
+    qty_events:   list[tuple[float, float]] = []       # (y, qty)
+
     all_barcodes: list[str] = []
-    row_features: list[dict] = []
-    for row in rows:
-        feat = _row_features(row)
-        row_features.append(feat)
-        all_barcodes.extend(bc for _, bc in feat["barcodes"])
+    _seen_bc_pos: dict[str, float] = {}  # barcode → first Y seen; dedup multipass duplicates
+    for ln in sorted(ocr.lines, key=_row_y):
+        y = _row_y(ln)
+        for bc in _extract_barcodes(ln.text):
+            prev_y = _seen_bc_pos.get(bc)
+            if prev_y is not None and abs(prev_y - y) <= y_tol:
+                continue  # same barcode at same position from another OCR pass
+            _seen_bc_pos[bc] = y
+            bc_events.append((y, bc, ln.text))
+            all_barcodes.append(bc)
+        for p in PRICE_RE.findall(ln.text):
+            v = _to_float(p)
+            if v is not None:
+                price_events.append((y, v, ln.text))
+        for q in QTY_RE.findall(ln.text):
+            try:
+                qty_events.append((y, float(q)))
+            except ValueError:
+                pass
+
     catalog = _lookup_barcodes(all_barcodes)
 
-    # Second pass: absorb orphan price-only rows into an immediately-adjacent
-    # barcode row IFF that host row has no price yet. The "no price yet" guard
-    # prevents pulling the receipt's grand total down onto the last item — a
-    # common mistake on Carrefour-style receipts where totals sit just below.
-    has_bc = [bool(f["barcodes"]) for f in row_features]
-    for ri, feat in enumerate(row_features):
-        if has_bc[ri] or not feat["prices"]:
-            continue
-        # only consider directly-adjacent rows (above first, then below)
-        host = None
-        for j in (ri - 1, ri + 1):
-            if 0 <= j < len(row_features) and has_bc[j] and not row_features[j]["prices"]:
-                host = j
-                break
-        if host is None:
-            continue
-        row_features[host]["prices"].extend(feat["prices"])
-        feat["prices"].clear()
+    # --- greedily match each barcode to the nearest unclaimed price ---
+    claimed = [False] * len(price_events)
 
-    # Third pass: emit items.
+    def _find_price(bc_y: float) -> tuple[int, float] | None:
+        """Return (index, value) of nearest unclaimed price within scan_window."""
+        best_idx, best_dist, best_val = -1, float("inf"), 0.0
+        for i, (py, pv, _) in enumerate(price_events):
+            if claimed[i]:
+                continue
+            dist = abs(py - bc_y)
+            if dist <= scan_window and dist < best_dist:
+                best_idx, best_dist, best_val = i, dist, pv
+        return (best_idx, best_val) if best_idx >= 0 else None
+
     items: list[ExtractedItem] = []
-    for ri, feat in enumerate(row_features):
-        bcs = feat["barcodes"]
-        prices = feat["prices"]
-        qtys = feat["qtys"]
-        weights = feat["weights"]
-        joined = " ".join(ln.text for ln in rows[ri])
+    for bc_y, bc, raw in bc_events:
+        cat = catalog.get(bc)
+        name = cat["name"] if cat and cat.get("name") else None
+        hit = _find_price(bc_y)
+        if hit:
+            idx, price = hit
+            claimed[idx] = True
+        else:
+            price = 0.0
+        # qty from nearby qty_events
+        qty = next((q for qy, q in qty_events if abs(qy - bc_y) <= scan_window), None)
+        items.append(ExtractedItem(
+            raw_name=name or bc,
+            barcode=bc,
+            quantity=qty,
+            unit_price=None,
+            line_total=price,
+        ))
 
-        if not bcs and not prices:
+    # --- remaining unclaimed prices become anonymous items ---
+    for i, (py, pv, raw) in enumerate(price_events):
+        if claimed[i]:
             continue
+        cleaned = BARCODE_RE.sub("", PRICE_RE.sub("", raw)).strip(" \t·-")
+        items.append(ExtractedItem(
+            raw_name=cleaned,
+            barcode=None,
+            quantity=None,
+            unit_price=None,
+            line_total=pv,
+        ))
 
-        qty: float | None = (
-            weights[0] if weights else (qtys[0] if qtys else None)
-        )
+    # Separate barcode items from price-only items.
+    bc_items   = [it for it in items if it.barcode]
+    anon_items = [it for it in items if not it.barcode]
 
-        if bcs:
-            for bc, line_total, unit_price in _pair_prices_to_barcodes(bcs, prices):
-                cat = catalog.get(bc)
-                name = cat["name"] if cat and cat.get("name") else None
-                items.append(ExtractedItem(
-                    raw_name=name or BARCODE_RE.sub("", PRICE_RE.sub("", joined)).strip(" \t·-") or bc,
-                    barcode=bc,
-                    quantity=qty,
-                    unit_price=unit_price,
-                    line_total=line_total or 0.0,
-                ))
-        elif prices:
-            # No barcode and we couldn't absorb upstream — emit a price-only
-            # item so the user sees we noticed something there.
-            biggest = max(prices, key=lambda p: p[1])[1]
-            items.append(ExtractedItem(
-                raw_name=BARCODE_RE.sub("", PRICE_RE.sub("", joined)).strip(" \t·-"),
-                barcode=None, quantity=qty, unit_price=None, line_total=biggest,
-            ))
+    # If any price-only item is ≥90% of the barcode-items sum it's the grand
+    # total — use it for total_paid but don't count it as a purchase.
+    bc_sum = sum(it.line_total for it in bc_items if it.line_total > 0)
+    grand_total: float | None = None
+    leftover_anon: list[ExtractedItem] = []
+    for it in anon_items:
+        v = it.line_total
+        if v > 999:
+            pass  # barcode fragment — skip
+        elif bc_sum > 0 and 0.85 <= v / bc_sum <= 1.15:
+            grand_total = v  # matches sum of barcode items → receipt total
+        elif bc_sum > 0 and v > bc_sum * 1.15:
+            grand_total = grand_total or v  # keep largest as backup total
+        else:
+            leftover_anon.append(it)
 
-    total_paid = sum(it.line_total for it in items if it.line_total > 0) or None
+    items = bc_items + leftover_anon
+    total_paid = grand_total or (bc_sum if bc_sum else None)
 
     return Extracted(
         items=items,

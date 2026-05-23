@@ -37,13 +37,22 @@ def _classify(filename: str) -> str:
 
 
 def _store_code(filename: str) -> str | None:
-    # PriceFull7290058140886-001-070-20260420-070019.gz → '070' (3rd dash part = store)
-    # naming varies: sometimes -NNN- once, sometimes twice. Pick the first 3-digit segment.
+    # Filename: <Type><ChainID>-[<SubChain>-]<Store>-<YYYYMMDD>-<HHMMSS>.gz
+    # Some chains prefix with a sub-chain code (e.g. '001') before the actual
+    # store code (e.g. '401'). Return the LAST 3-4 digit numeric segment that
+    # appears BEFORE the 8-digit date, so we always get the store, never the
+    # sub-chain.
+    # e.g. Price7290492000005-001-401-20260503-070001.gz → '401'
+    #      PriceFull7290058140886-001-070-20260420-070019.gz → '070'
+    #      PriceFull7290058140886-732-202605031500.gz → '732' (no date sep)
     parts = filename.split("-")
+    candidates: list[str] = []
     for p in parts[1:]:
+        if len(p) == 8 and p.isdigit():  # YYYYMMDD date marker — stop here
+            break
         if p.isdigit() and len(p) in (3, 4):
-            return p
-    return None
+            candidates.append(p)
+    return candidates[-1] if candidates else None
 
 
 class PublishedPricesScraper(BaseChainScraper):

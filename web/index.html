@@ -6,9 +6,10 @@
 <meta name="theme-color" content="#0b1020"/>
 <meta name="description" content="מחירי סופרמרקטים בישראל — כל הרשתות במקום אחד"/>
 <title>super-price-il · מודיעין מחירים</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml"/>
 <link rel="stylesheet" href="style.css"/>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.min.css"/>
-<script defer src="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.iife.min.js"></script>
+<link rel="stylesheet" href="js/lib/uPlot.min.css"/>
+<script src="js/lib/uPlot.iife.min.js"></script>
 </head>
 <body>
 <a class="skip-link" href="#main">דלג לתוכן הראשי</a>
@@ -16,7 +17,7 @@
 <header role="banner">
   <div class="header-row">
     <div>
-      <h1>super-price-il</h1>
+      <h1>super-price-il <span class="app-version" id="app-version"></span></h1>
       <p class="tag">מחירי סופרמרקטים בישראל — כל הרשתות במקום אחד</p>
     </div>
     <button class="icon-btn" id="btn-settings" type="button" aria-label="הגדרות ומיקום" title="הגדרות">⚙</button>
@@ -27,19 +28,19 @@
 </header>
 
 <nav class="tabs" role="tablist" aria-label="מצבי חיפוש">
-  <button class="tab active" role="tab" data-tab="search"    aria-selected="true"  aria-controls="pane-search">חיפוש</button>
+  <button class="tab"        role="tab" data-tab="search"    aria-selected="false" aria-controls="pane-search">חיפוש</button>
   <button class="tab"        role="tab" data-tab="nl"        aria-selected="false" aria-controls="pane-nl">חיפוש חכם (AI)</button>
   <button class="tab"        role="tab" data-tab="trends"    aria-selected="false" aria-controls="pane-trends">גרף מחיר</button>
   <button class="tab"        role="tab" data-tab="dashboard" aria-selected="false" aria-controls="pane-dashboard">לוח בקרה</button>
   <button class="tab"        role="tab" data-tab="receipt"   aria-selected="false" aria-controls="pane-receipt">קבלה</button>
   <button class="tab"        role="tab" data-tab="live"      aria-selected="false" aria-controls="pane-live">סריקה חיה</button>
-  <button class="tab"        role="tab" data-tab="scrape"    aria-selected="false" aria-controls="pane-scrape">סטטוס סריקה</button>
+  <button class="tab active" role="tab" data-tab="scrape"    aria-selected="true"  aria-controls="pane-scrape">סטטוס סריקה</button>
 </nav>
 
 <main id="main">
 
 <!-- search tab -->
-<section class="pane active" id="pane-search" role="tabpanel" aria-labelledby="tab-search">
+<section class="pane" id="pane-search" role="tabpanel" aria-labelledby="tab-search" hidden>
   <form id="form-search" role="search" aria-label="חיפוש מוצרים">
     <input name="q" placeholder="שם מוצר או ברקוד…" autocomplete="off" aria-label="שאילתת חיפוש" aria-describedby="search-hint"/>
     <select name="chain" aria-label="רשת">
@@ -173,26 +174,18 @@
 <!-- receipt -->
 <section class="pane" id="pane-receipt" role="tabpanel" aria-labelledby="tab-receipt" hidden>
   <form id="form-receipt" enctype="multipart/form-data">
-    <label class="dropzone" id="dropzone" tabindex="0" aria-label="גרור לכאן קובץ קבלה או לחץ לבחירה">
-      <input type="file" name="file" id="receipt-file" accept="image/*,application/pdf" hidden/>
+    <input type="file" name="files" id="receipt-file" accept="image/*,application/pdf"
+           multiple style="position:absolute;left:-9999px;opacity:0;width:1px;height:1px"/>
+    <div class="dropzone" id="dropzone" tabindex="0" role="button"
+         aria-label="גרור לכאן תמונות קבלה או לחץ לבחירה">
       <div class="dz-inner">
         <div class="dz-icon" aria-hidden="true">⬆</div>
-        <div class="dz-main">גרור קובץ לכאן או לחץ לבחירה</div>
-        <div class="dz-sub">PDF או תמונה (JPG/PNG/HEIC)</div>
+        <div class="dz-main">גרור תמונות לכאן או לחץ לבחירה</div>
+        <div class="dz-sub">ניתן לבחור מספר תמונות לקבלה ארוכה · JPG / PNG / HEIC / PDF</div>
         <div class="dz-preview" id="dz-preview" hidden></div>
       </div>
-    </label>
+    </div>
     <input name="city" placeholder="העיר שלך (לחיפוש חלופות)" aria-label="עיר"/>
-    <label class="provider-pick">
-      <span>מנוע OCR</span>
-      <select name="provider" id="receipt-provider" aria-label="בחר מנוע OCR">
-        <option value="">ברירת מחדל (Claude)</option>
-        <option value="auto">אוטומטי — חינם תחילה</option>
-        <option value="rapid">RapidOCR (מקומי, חינם)</option>
-        <option value="ocrspace">OCR.space (חינם, אונליין)</option>
-        <option value="claude">Claude (איכות גבוהה)</option>
-      </select>
-    </label>
     <button type="submit">העלה וחשב חיסכון</button>
   </form>
   <div class="progress" id="receipt-progress" hidden>
@@ -204,7 +197,8 @@
 </section>
 
 <!-- scrape status (live) -->
-<section class="pane" id="pane-scrape" role="tabpanel" aria-labelledby="tab-scrape" hidden>
+<section class="pane active" id="pane-scrape" role="tabpanel" aria-labelledby="tab-scrape">
+  <div id="scrape-big-gauge" class="big-gauge"></div>
   <div class="scrape-toolbar" role="region" aria-label="פעולות סטטוס סריקה">
     <div class="scrape-summary" id="scrape-summary"></div>
     <div class="scrape-actions">
@@ -222,21 +216,54 @@
 <!-- live OCR -->
 <section class="pane" id="pane-live" role="tabpanel" aria-labelledby="tab-live" hidden>
   <div class="live-toolbar">
-    <button type="button" id="live-start"  class="btn-primary">▶ הפעל מצלמה</button>
-    <button type="button" id="live-stop"   class="btn-secondary" hidden>■ עצור</button>
-    <button type="button" id="live-reset"  class="btn-secondary" hidden>נקה רשימה</button>
+    <button type="button" id="live-start"    class="btn-primary">📷 התחל סריקה</button>
+    <button type="button" id="live-stop"     class="btn-finish" hidden>✓ סיים סריקה</button>
+    <button type="button" id="live-reset"    class="btn-secondary" hidden>נקה</button>
+    <button type="button" id="live-scan-now" class="btn-primary" hidden>📸 סרוק עכשיו</button>
+    <select id="live-ocr-mode" title="מנוע OCR" hidden>
+      <option value="rapid">⚡ מהיר (RapidOCR)</option>
+      <option value="claude">🧠 מדויק (Claude)</option>
+    </select>
     <span class="live-status" id="live-status" aria-live="polite"></span>
   </div>
+  <pre id="live-debug" style="
+    font-size:10px;line-height:1.3;background:#0a0a0a;color:#86efac;
+    padding:6px 8px;margin:4px 0;border-radius:6px;
+    max-height:160px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;
+    direction:ltr;text-align:left;
+  "></pre>
   <div class="live-grid">
     <div class="live-stage">
       <video id="live-video" playsinline muted autoplay></video>
       <svg id="live-overlay" preserveAspectRatio="none" aria-hidden="true"></svg>
-      <div class="live-corners" aria-hidden="true">
-        <span></span><span></span><span></span><span></span>
+      <!-- central targeting zone: where user should place the barcode -->
+      <div class="live-target" id="live-target" aria-hidden="true">
+        <div class="live-target-frame">
+          <span class="ltc ltc-tl"></span>
+          <span class="ltc ltc-tr"></span>
+          <span class="ltc ltc-bl"></span>
+          <span class="ltc ltc-br"></span>
+          <div class="live-scanline" id="live-scanline"></div>
+        </div>
+        <div class="live-target-tip">הצב את קוד המוצר בתוך המסגרת · גע למיקוד</div>
+      </div>
+      <!-- shown before camera starts -->
+      <div class="live-hint" id="live-hint" aria-hidden="true">
+        <div class="live-hint-icon">📷</div>
+        <div class="live-hint-text">הצב את קוד המוצר בתוך המסגרת</div>
+        <div class="live-hint-sub">גע על המסך למיקוד · החזק במרחק 15–25 ס"מ</div>
       </div>
     </div>
     <aside class="live-side" aria-label="פריטים מזוהים בזמן אמת">
+      <form class="live-search" id="live-search-form" autocomplete="off" role="search" aria-label="חיפוש מוצר">
+        <input id="live-search-input" type="search"
+               placeholder="חפש מוצר או ברקוד לצפייה במחירים…"
+               aria-label="שם מוצר או ברקוד"/>
+        <button type="submit" class="btn-secondary">חפש</button>
+      </form>
+      <div id="live-search-results" class="live-search-results" hidden role="listbox" aria-label="תוצאות חיפוש"></div>
       <div class="live-totals" id="live-totals"></div>
+      <div class="live-summary" id="live-summary" hidden></div>
       <div class="live-items" id="live-items" role="list"></div>
       <div class="live-legend" aria-hidden="true">
         <span class="lk-barcode">ברקוד</span>

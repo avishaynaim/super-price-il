@@ -415,19 +415,39 @@ async function loadRetailersStatus() {
     const totMissingStores   = rows.reduce((a, r) => a + (r.stores_missing   || 0), 0);
     const totMissingProducts = rows.reduce((a, r) => a + (r.products_missing || 0), 0);
 
-    const statusIcon = s => ({
-      fresh: '<span class="pill ok">🟢 היום</span>',
-      stale: '<span class="pill warn">🟡 ישן</span>',
-      gone:  '<span class="pill err">🔴 פג</span>',
-      never: '<span class="pill err">⚫ אין</span>',
-    })[s] || s;
-
-    const healthIcon = h => ({
-      ok:      '<span class="pill ok">✅ תקין</span>',
-      partial: '<span class="pill warn">🟡 חלקי</span>',
-      thin:    '<span class="pill warn">⚠️ דליל</span>',
-      dead:    '<span class="pill err">💀 מת</span>',
-    })[h] || h;
+    // Unified progress: combines status + health + coverage into a single bar.
+    const progressCell = (r) => {
+      if (r.running_now) {
+        const p = r.progress || {};
+        const pct = Math.min(100, Math.max(0, p.pct ?? 0));
+        return `<div class="prog prog-running">
+          <div class="prog-bar"><span style="width:${pct}%"></span></div>
+          <div class="prog-label"><span class="dot-pulse"></span>מתעדכן · ${pct}%</div>
+        </div>`;
+      }
+      if (r.status === 'never') {
+        return `<div class="prog prog-miss">
+          <div class="prog-bar"><span style="width:0%"></span></div>
+          <div class="prog-label">לא נסרק</div>
+        </div>`;
+      }
+      if (r.status === 'gone' || r.health === 'dead') {
+        return `<div class="prog prog-miss">
+          <div class="prog-bar"><span style="width:0%"></span></div>
+          <div class="prog-label">${r.status === 'gone' ? 'פג תוקף' : 'מת'}</div>
+        </div>`;
+      }
+      const total = r.stores_total || 0;
+      const has   = r.stores_with_data || 0;
+      const pct   = total > 0 ? Math.round((has / total) * 100) : 0;
+      let cls = 'prog-ok';
+      if (r.status === 'stale' || r.health === 'partial' || r.health === 'thin' || pct < 80) cls = 'prog-warn';
+      if (pct < 30) cls = 'prog-miss';
+      return `<div class="prog ${cls}">
+        <div class="prog-bar"><span style="width:${pct}%"></span></div>
+        <div class="prog-label">${pct}% · ${has}/${total} חנויות</div>
+      </div>`;
+    };
 
     let html = `
       <div class="ret-summary">
@@ -442,8 +462,7 @@ async function loadRetailersStatus() {
       <table class="dash-retailers-table">
         <thead><tr>
           <th>רשת</th>
-          <th>סטטוס</th>
-          <th>בריאות</th>
+          <th>התקדמות</th>
           <th title="חנויות במאגר / מתוכן עם מחירים נוכחיים">חנויות (יש/חסר)</th>
           <th title="מוצרים שיש להם מחיר נוכחי / מוצרים שנצפו אי-פעם בקבצי הרשת">מוצרים (יש/חסר)</th>
           <th>מחירים נוכחיים</th>
@@ -465,8 +484,7 @@ async function loadRetailersStatus() {
             <div class="ret-name">${escapeHtml(r.name_he || r.code)}</div>
             <div class="ret-code">${escapeHtml(r.code)}</div>
           </td>
-          <td>${statusIcon(r.status)}</td>
-          <td>${healthIcon(r.health)}</td>
+          <td class="prog-cell">${progressCell(r)}</td>
           <td class="num">
             <b>${fmtNum(stHas)}</b><span class="muted"> / ${fmtNum(stTot)}</span>
             ${stMiss > 0 ? `<div class="miss">חסר: ${fmtNum(stMiss)}</div>` : ""}

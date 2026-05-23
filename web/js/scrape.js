@@ -20,8 +20,85 @@ const POLL_MS_HIDDEN         = 60_000; // back off when tab not focused
 
 let timer = null;
 let lastRows = [];
+let dataRows = [];   // raw API data (unsorted), preserved across renders
+let sortCol = null;  // active sort column index, or null
+let sortDir = 1;     // 1 = asc, -1 = desc
 let etaTick = null;
 let countdownTick = null;
+
+function progressPct(r) {
+  if (r.running_now) return r.progress?.pct ?? 0;
+  if (r.status === 'never' || r.status === 'gone' || r.health === 'dead') return -1;
+  const t = r.stores_total || 0, h = r.stores_with_data || 0;
+  return t > 0 ? (h / t) * 100 : 0;
+}
+
+const COL_SORT_FNS = [
+  r => (r.name_he || r.code).toLowerCase(),
+  r => progressPct(r),
+  r => r.stores_with_data || 0,
+  r => r.products_priced || 0,
+  r => r.current_prices || 0,
+  r => r.last_scrape_at
+    ? new Date((r.last_scrape_at.endsWith('Z') || r.last_scrape_at.includes('+'))
+        ? r.last_scrape_at : r.last_scrape_at + 'Z').getTime()
+    : 0,
+  r => r.running_now ? (r.eta_seconds || 0) : (r.next_run_eta_seconds ?? 1e9),
+];
+
+function applySortedRows(rows) {
+  if (sortCol === null || !COL_SORT_FNS[sortCol]) return rows;
+  const fn = COL_SORT_FNS[sortCol];
+  return [...rows].sort((a, b) => {
+    const va = fn(a), vb = fn(b);
+    if (va < vb) return -sortDir;
+    if (va > vb) return sortDir;
+    return 0;
+  });
+}
+
+// Reorder <tr> elements and update arrow indicators without re-rendering the table.
+function sortInPlace() {
+  if (sortCol === null) return;
+  const tbody = document.querySelector(".scrape-table tbody");
+  if (!tbody || !dataRows.length) return;
+  const fn = COL_SORT_FNS[sortCol];
+  if (!fn) return;
+
+  // update header arrows and active class
+  document.querySelectorAll(".scrape-table th[data-sort-col]").forEach(th => {
+    const col = +th.dataset.sortCol;
+    const active = col === sortCol;
+    th.classList.toggle("th-sorted", active);
+    const span = th.querySelector(".th-arrow");
+    if (span) span.textContent = active ? (sortDir === 1 ? ' ▲' : ' ▼') : ' ⇅';
+  });
+
+  // reorder existing <tr> elements in-place
+  const byCode = new Map(dataRows.map(r => [r.code, r]));
+  const trs = [...tbody.querySelectorAll("tr[data-code]")];
+  trs.sort((a, b) => {
+    const ra = byCode.get(a.dataset.code);
+    const rb = byCode.get(b.dataset.code);
+    if (!ra || !rb) return 0;
+    const va = fn(ra), vb = fn(rb);
+    if (va < vb) return -sortDir;
+    if (va > vb) return sortDir;
+    return 0;
+  });
+  trs.forEach(tr => tbody.appendChild(tr)); // moves each tr to end in sorted order
+}
+
+const COLS = [
+  { label: 'רשת' },
+  { label: 'התקדמות' },
+  { label: 'חנויות (יש/חסר)', title: 'חנויות במאגר / מתוכן עם מחירים נוכחיים' },
+  { label: 'מוצרים (יש/חסר)', title: 'מוצרים שיש להם מחיר נוכחי / מוצרים שנצפו אי-פעם בקבצי הרשת' },
+  { label: 'מחירים נוכחיים' },
+  { label: 'סריקה אחרונה' },
+  { label: 'ETA' },
+  { label: '' },
+];
 
 const $ = id => document.getElementById(id);
 
@@ -45,22 +122,48 @@ function fmtSecs(s) {
   return `${h} שע׳ ${m} דק׳`;
 }
 
-function statusIcon(s) {
-  return ({
-    fresh: '<span class="pill ok">🟢 היום</span>',
-    stale: '<span class="pill warn">🟡 ישן</span>',
-    gone:  '<span class="pill err">🔴 פג</span>',
-    never: '<span class="pill err">⚫ אין</span>',
-  })[s] || s;
+function fmtBytes(b) {
+  if (b == null) return "—";
+  if (b < 1024) return b + " B";
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB";
+  if (b < 1024 * 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + " MB";
+  return (b / 1024 / 1024 / 1024).toFixed(2) + " GB";
 }
 
-function healthIcon(h) {
-  return ({
-    ok:      '<span class="pill ok">✅ תקין</span>',
-    partial: '<span class="pill warn">🟡 חלקי</span>',
-    thin:    '<span class="pill warn">⚠️ דליל</span>',
-    dead:    '<span class="pill err">💀 מת</span>',
-  })[h] || h;
+// Unified progress: one bar replacing the old "סטטוס" + "בריאות" pair.
+// Combines run state, coverage, and freshness into a single 0-100% with label.
+function progressCell(r) {
+  if (r.running_now) {
+    const p = r.progress || {};
+    const pct = Math.min(100, Math.max(0, p.pct ?? 0));
+    return `
+      <div class="prog prog-running">
+        <div class="prog-bar"><span style="width:${pct}%"></span></div>
+        <div class="prog-label"><span class="dot-pulse"></span>מתעדכן · ${pct}%</div>
+      </div>`;
+  }
+  if (r.status === 'never') {
+    return `<div class="prog prog-miss">
+      <div class="prog-bar"><span style="width:0%"></span></div>
+      <div class="prog-label">לא נסרק</div>
+    </div>`;
+  }
+  if (r.status === 'gone' || r.health === 'dead') {
+    return `<div class="prog prog-miss">
+      <div class="prog-bar"><span style="width:0%"></span></div>
+      <div class="prog-label">${r.status === 'gone' ? 'פג תוקף' : 'מת'}</div>
+    </div>`;
+  }
+  const total = r.stores_total || 0;
+  const has   = r.stores_with_data || 0;
+  const pct   = total > 0 ? Math.round((has / total) * 100) : 0;
+  let cls = 'prog-ok';
+  if (r.status === 'stale' || r.health === 'partial' || r.health === 'thin' || pct < 80) cls = 'prog-warn';
+  if (pct < 30) cls = 'prog-miss';
+  return `<div class="prog ${cls}">
+    <div class="prog-bar"><span style="width:${pct}%"></span></div>
+    <div class="prog-label">${pct}% · ${has}/${total} חנויות</div>
+  </div>`;
 }
 
 function etaCell(r) {
@@ -116,8 +219,7 @@ function rowHtml(r) {
         <div class="ret-name">${escapeHtml(r.name_he || r.code)}</div>
         <div class="ret-code">${escapeHtml(r.code)}</div>
       </td>
-      <td>${statusIcon(r.status)}</td>
-      <td>${healthIcon(r.health)}</td>
+      <td class="prog-cell">${progressCell(r)}</td>
       <td class="num">
         <b>${fmtNum(stHas)}</b><span class="muted"> / ${fmtNum(stTot)}</span>
         ${stMiss > 0 ? `<div class="miss">חסר: ${fmtNum(stMiss)}</div>` : ""}
@@ -131,6 +233,93 @@ function rowHtml(r) {
       <td class="eta-cell">${etaCell(r)}</td>
       <td><button class="btn-small" type="button" data-action="view-stores">צפה בחנויות</button></td>
     </tr>`;
+}
+
+// Big gauge at top of the scrape tab.
+// Aggregate progress = average per-chain progress %, where each chain gets:
+//   running_now → its live progress.pct
+//   never/gone  → 0
+//   fresh/stale → stores_with_data / stores_total
+function bigGaugeHtml(rows) {
+  if (!rows.length) return '';
+  let sum = 0, n = 0, runningCount = 0, doneCount = 0, missCount = 0;
+  let totalFiles = 0, doneFiles = 0, totalRows = 0;
+  let maxEta = 0, sumRate = 0;
+  for (const r of rows) {
+    let pct = 0;
+    if (r.running_now) {
+      const p = r.progress || {};
+      pct = Math.min(100, Math.max(0, p.pct ?? 0));
+      runningCount++;
+      totalFiles += p.files_total || 0;
+      doneFiles  += p.files_done  || 0;
+      totalRows  += p.rows_written|| 0;
+      sumRate    += p.rate_files_per_sec || 0;
+      if (r.eta_seconds && r.eta_seconds > maxEta) maxEta = r.eta_seconds;
+    } else if (r.status === 'never' || r.status === 'gone' || r.health === 'dead') {
+      pct = 0;
+      missCount++;
+    } else {
+      const t = r.stores_total || 0;
+      const h = r.stores_with_data || 0;
+      pct = t > 0 ? (h / t) * 100 : 0;
+      if (pct >= 80) doneCount++;
+    }
+    sum += pct; n++;
+  }
+  const avg = Math.round(sum / n);
+  let cls = 'big-ok';
+  if (runningCount > 0) cls = 'big-running';
+  else if (avg < 30) cls = 'big-miss';
+  else if (avg < 80) cls = 'big-warn';
+
+  const headline = runningCount > 0 ? 'סורק כעת' :
+                   avg >= 80 ? 'נתונים מלאים' :
+                   avg >= 30 ? 'כיסוי חלקי' : 'אין כיסוי מספיק';
+
+  // build stat tiles (use _lastHealth from outer scope if present)
+  const h = _lastHealth || {};
+  const tiles = [];
+  // Live progress info (only when scraping)
+  if (runningCount > 0) {
+    tiles.push(['🔄', 'סורק עכשיו', `${runningCount} רשתות`]);
+    tiles.push(['📂', 'קבצים', `${fmtNum(doneFiles)} / ${fmtNum(totalFiles)}`]);
+    tiles.push(['⏱️', 'ETA', fmtSecs(maxEta || null)]);
+    tiles.push(['⚡', 'קצב', `${sumRate.toFixed(2)} קבצים/שנ׳`]);
+  } else {
+    tiles.push(['✅', 'מלאות', `${doneCount}`]);
+    tiles.push(['⚫', 'ללא נתונים', `${missCount}`]);
+    tiles.push(['📊', 'רשתות סה"כ', `${rows.length}`]);
+  }
+  // Cumulative DB stats
+  tiles.push(['💰', 'מחירים נוכחיים', fmtNum(h.current_prices)]);
+  tiles.push(['📦', 'מוצרים', fmtNum(h.products)]);
+  tiles.push(['🏪', 'חנויות', fmtNum(h.stores)]);
+  // Disk
+  tiles.push(['💾', 'גודל DB', fmtBytes(h.db_bytes)]);
+  if (h.raw_bytes != null) tiles.push(['📥', 'קבצי GZ', fmtBytes(h.raw_bytes)]);
+  if (h.free_bytes != null) tiles.push(['🆓', 'פנוי בדיסק', fmtBytes(h.free_bytes)]);
+
+  const tilesHtml = tiles.map(([ico, label, val]) => `
+    <div class="big-tile">
+      <div class="big-tile-ico">${ico}</div>
+      <div class="big-tile-val">${val}</div>
+      <div class="big-tile-label">${label}</div>
+    </div>`).join('');
+
+  return `
+    <div class="big-gauge-inner ${cls}">
+      <div class="big-gauge-circle" style="--pct:${avg}">
+        <div class="big-gauge-pct">${avg}<small>%</small></div>
+        <div class="big-gauge-label">סטטוס סריקה</div>
+      </div>
+      <div class="big-gauge-side">
+        <div class="big-gauge-headline">
+          ${runningCount > 0 ? '<span class="big-pulse"></span>' : ''}${headline}
+        </div>
+        <div class="big-tiles">${tilesHtml}</div>
+      </div>
+    </div>`;
 }
 
 function summaryHtml(rows) {
@@ -156,19 +345,18 @@ function render(rows) {
   const wrap = $("scrape-table-wrap");
   if (!wrap) return;
   $("scrape-summary").innerHTML = summaryHtml(rows);
+  $("scrape-big-gauge").innerHTML = bigGaugeHtml(rows);
+  const theadHtml = COLS.map((c, i) => {
+    if (!c.label) return '<th></th>';
+    const isSorted = sortCol === i;
+    const arrow = isSorted ? (sortDir === 1 ? ' ▲' : ' ▼') : ' ⇅';
+    const cls = isSorted ? ' class="th-sort th-sorted"' : ' class="th-sort"';
+    const titleAttr = c.title ? ` title="${c.title}"` : '';
+    return `<th${cls}${titleAttr} data-sort-col="${i}">${c.label}<span class="th-arrow">${arrow}</span></th>`;
+  }).join('');
   wrap.innerHTML = `
     <table class="dash-retailers-table scrape-table">
-      <thead><tr>
-        <th>רשת</th>
-        <th>סטטוס</th>
-        <th>בריאות</th>
-        <th title="חנויות במאגר / מתוכן עם מחירים נוכחיים">חנויות (יש/חסר)</th>
-        <th title="מוצרים שיש להם מחיר נוכחי / מוצרים שנצפו אי-פעם בקבצי הרשת">מוצרים (יש/חסר)</th>
-        <th>מחירים נוכחיים</th>
-        <th>סריקה אחרונה</th>
-        <th>ETA</th>
-        <th></th>
-      </tr></thead>
+      <thead><tr>${theadHtml}</tr></thead>
       <tbody>${rows.map(rowHtml).join("")}</tbody>
     </table>`;
   // open per-retailer modal on row click / button
@@ -186,15 +374,16 @@ function render(rows) {
 }
 
 function diffRender(rows) {
+  dataRows = rows;
   // First-render path: full HTML. Otherwise: only update cells that changed
   // so the table doesn't flicker the user out of selection.
   if (!lastRows.length) {
-    render(rows);
+    render(applySortedRows(rows));
     lastRows = rows;
     return;
   }
   const tbody = document.querySelector(".scrape-table tbody");
-  if (!tbody) { render(rows); lastRows = rows; return; }
+  if (!tbody) { render(applySortedRows(rows)); lastRows = rows; return; }
   const byCode = new Map(rows.map(r => [r.code, r]));
   const seenCodes = new Set();
   for (const tr of tbody.querySelectorAll("tr")) {
@@ -212,6 +401,7 @@ function diffRender(rows) {
       prev.status           !== r.status           ||
       prev.health           !== r.health           ||
       prev.running_now      !== r.running_now      ||
+      (prev.progress?.pct ?? 0) !== (r.progress?.pct ?? 0) ||
       prev.last_scrape_at   !== r.last_scrape_at;
     if (cellsChanged) {
       const newRow = document.createElement("tbody");
@@ -238,6 +428,7 @@ function diffRender(rows) {
     }
   }
   $("scrape-summary").innerHTML = summaryHtml(rows);
+  $("scrape-big-gauge").innerHTML = bigGaugeHtml(rows);
   lastRows = rows;
 }
 
@@ -303,9 +494,14 @@ async function openChainStoresModal(code) {
 
 // ---------- polling ----------
 
+let _lastHealth = null;
 async function fetchAndRender() {
   try {
-    const rows = await api("/api/stats/retailers-status");
+    const [rows, health] = await Promise.all([
+      api("/api/stats/retailers-status"),
+      api("/api/health").catch(() => null),
+    ]);
+    _lastHealth = health;
     const wasAnyRunning = lastRows.some(r => r.running_now);
     diffRender(rows);
     $("scrape-last-update").textContent = "עודכן " + new Date().toLocaleTimeString("he-IL");
@@ -345,16 +541,19 @@ function stopPolling() {
 
 function tickCountdowns() {
   document.querySelectorAll(".scrape-table .eta").forEach(el => {
-    const eta  = +el.dataset.eta;
-    const next = +el.dataset.next;
-    let n = el.classList.contains("running") ? eta : next;
-    if (Number.isFinite(n) && n > 0) {
-      n -= 1;
-      if (el.classList.contains("running")) el.dataset.eta = String(n);
-      else el.dataset.next = String(n);
-      const span = el.querySelector(".dot-pulse");
-      const prefix = el.classList.contains("running") ? "מתעדכן · " : "בעוד ";
-      el.innerHTML = (span ? span.outerHTML + " " : "") + prefix + fmtSecs(n);
+    if (el.classList.contains("running")) {
+      const n = +el.dataset.eta;
+      if (Number.isFinite(n) && n > 0) {
+        el.dataset.eta = String(n - 1);
+        const timeSpan = el.querySelector(".eta-time");
+        if (timeSpan) timeSpan.textContent = `· ${fmtSecs(n - 1)}`;
+      }
+    } else {
+      const n = +el.dataset.next;
+      if (Number.isFinite(n) && n > 0) {
+        el.dataset.next = String(n - 1);
+        el.textContent = `בעוד ${fmtSecs(n - 1)}`;
+      }
     }
   });
 }
@@ -368,6 +567,18 @@ export function initScrapeStatus() {
   if (!$("pane-scrape")) return;
   $("scrape-refresh")?.addEventListener("click", fetchAndRender);
   $("scrape-auto")?.addEventListener("change", autoToggle);
+
+  // Single document-level listener — survives table re-renders.
+  // closest() on the target walks up and finds the <th data-sort-col> if it exists.
+  document.addEventListener("click", e => {
+    const th = e.target.closest("#scrape-table-wrap th[data-sort-col]");
+    if (!th) return;
+    const col = +th.dataset.sortCol;
+    if (sortCol === col) sortDir *= -1;
+    else { sortCol = col; sortDir = 1; }
+    sortInPlace();
+  });
+
   document.addEventListener("visibilitychange", () => {
     if (current().tab !== "scrape") return;
     if (document.hidden) {

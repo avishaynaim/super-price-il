@@ -39,9 +39,8 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from ..db.pg import cursor as _pg_cursor
-from ..receipts.free_ocr import rapid_ocr
-from ..receipts.parse_lines import BARCODE_RE, PRICE_RE, QTY_RE
+from ..receipts.free_ocr import rapid_ocr_multipass
+from ..receipts.parse_lines import BARCODE_RE, PRICE_RE, QTY_RE, _extract_barcodes
 
 
 live_ocr_router = APIRouter()
@@ -50,11 +49,11 @@ live_ocr_router = APIRouter()
 # updates every second or two. A smaller max_long_side trades small-text
 # recall for ~3× speedup. Receipts in the viewfinder are usually big enough
 # that 800px is plenty.
-LIVE_MAX_LONG_SIDE = 800
+LIVE_MAX_LONG_SIDE = 1600  # higher res = more digits readable; speed is secondary
 
 
 def _classify(text: str) -> str:
-    if BARCODE_RE.search(text):
+    if _extract_barcodes(text):   # fuzzy: catches 1290→7290 and T290→7290 too
         return "barcode"
     if QTY_RE.search(text):
         return "qty"
@@ -64,15 +63,61 @@ def _classify(text: str) -> str:
 
 
 def _lookup_one(barcode: str) -> dict | None:
-    with _pg_cursor() as cur:
-        cur.execute(
-            "SELECT p.barcode, p.name, p.manufacturer, "
-            "       (SELECT MIN(cp.price) FROM current_prices cp WHERE cp.product_id = p.id) AS min_price "
-            "  FROM products p WHERE p.barcode = %s",
-            (barcode,),
-        )
-        row = cur.fetchone()
-    return dict(row) if row else None
+    from ..db.price_index import price_index
+    info = price_index.lookup(barcode)
+    if not info:
+        return None
+    cheapest = info.get("cheapest")
+    priciest = info.get("priciest")
+    return {
+        "barcode":        barcode,
+        "name":           info.get("name"),
+        "manufacturer":   info.get("manufacturer"),
+        "min_price":      cheapest["min_price"] if cheapest else None,
+        "max_price":      priciest["max_price"] if priciest else None,
+        "cheapest_chain": cheapest["chain_name_he"] if cheapest else None,
+        "priciest_chain": priciest["chain_name_he"] if priciest else None,
+        "all_chains":     info.get("chains", []),
+    }
+
+
+async def _claude_ocr_async(image_bytes: bytes, ws: "WebSocket") -> "OCRResult":
+    """Run Claude Code OCR in a thread — sends heartbeats so WS stays alive."""
+    import tempfile, os
+    from ..receipts.free_ocr import OCRLine, OCRResult
+    from ..receipts.claude_code_ocr import extract_barcodes as _claude_extract
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+        f.write(image_bytes)
+        tmp = f.name
+
+    try:
+        loop   = asyncio.get_event_loop()
+        future = loop.run_in_executor(None, lambda: _claude_extract(tmp, timeout=180))
+
+        # Poll every 4s — send heartbeat so browser knows we're alive
+        elapsed = 0
+        while not future.done():
+            await asyncio.sleep(4)
+            elapsed += 4
+            if future.done():
+                break
+            try:
+                await ws.send_text(json.dumps({"type": "processing",
+                                               "engine": "claude",
+                                               "elapsed_s": elapsed}))
+            except Exception:
+                future.cancel()
+                raise WebSocketDisconnect()
+
+        barcodes = future.result()
+        lines = [OCRLine(text=bc, box=(0.0, 0.0, 1.0, 1.0), confidence=1.0)
+                 for bc in barcodes]
+        return OCRResult(lines=lines, provider="claude-code",
+                         latency_ms=elapsed * 1000, image_size=(0, 0))
+    finally:
+        try: os.unlink(tmp)
+        except OSError: pass
 
 
 @live_ocr_router.websocket("/ws/live-ocr")
@@ -80,12 +125,11 @@ async def live_ocr(ws: WebSocket) -> None:
     await ws.accept()
     seen_barcodes: set[str] = set()
     basket_total: float = 0.0
-    latest_frame: tuple[str, bytes] | None = None
-    processing = asyncio.Event()
-    processing.set()
+    latest_frame: tuple[str, bytes, str] | None = None  # (id, raw, mode)
+    current_mode: str = "rapid"
 
     async def reader():
-        nonlocal latest_frame
+        nonlocal latest_frame, current_mode
         try:
             while True:
                 msg = await ws.receive_text()
@@ -107,8 +151,10 @@ async def live_ocr(ws: WebSocket) -> None:
                     raw = base64.b64decode(b64)
                 except (ValueError, TypeError):
                     continue
+                mode = obj.get("mode", "rapid")
+                current_mode = mode
                 # Drop the previous queued frame; keep only the newest.
-                latest_frame = (obj.get("id", ""), raw)
+                latest_frame = (obj.get("id", ""), raw, mode)
         except WebSocketDisconnect:
             pass
 
@@ -123,17 +169,18 @@ async def live_ocr(ws: WebSocket) -> None:
             await asyncio.sleep(0.05)
             if latest_frame is None:
                 continue
-            frame_id, raw = latest_frame
+            frame_id, raw, mode = latest_frame
             latest_frame = None
             try:
                 t0 = time.perf_counter()
-                # rapid_ocr is sync/CPU-bound; offload to a worker thread so
-                # the WS event loop keeps reading new frames in the background.
-                # Live frames are downscaled aggressively for snappier feedback.
-                ocr = await loop.run_in_executor(
-                    None,
-                    lambda: rapid_ocr(raw, max_long_side=LIVE_MAX_LONG_SIDE),
-                )
+
+                if mode == "claude":
+                    ocr = await _claude_ocr_async(raw, ws)
+                else:
+                    ocr = await loop.run_in_executor(
+                        None,
+                        lambda: rapid_ocr_multipass(raw, max_long_side=LIVE_MAX_LONG_SIDE),
+                    )
                 lines_payload: list[dict[str, Any]] = []
                 new_items: list[dict[str, Any]] = []
                 for ln in ocr.lines:
@@ -146,7 +193,7 @@ async def live_ocr(ws: WebSocket) -> None:
                     }
                     lines_payload.append(item_payload)
                     if kind == "barcode":
-                        for bc in BARCODE_RE.findall(ln.text):
+                        for bc in _extract_barcodes(ln.text):
                             if bc in seen_barcodes:
                                 continue
                             cat = _lookup_one(bc)
@@ -164,12 +211,16 @@ async def live_ocr(ws: WebSocket) -> None:
                             min_p = cat.get("min_price") or 0.0
                             basket_total += float(min_p or 0.0)
                             new_items.append({
-                                "barcode": bc,
-                                "name": cat.get("name"),
-                                "manufacturer": cat.get("manufacturer"),
-                                "min_price": min_p,
-                                "matched": True,
-                                "box": list(ln.box),
+                                "barcode":        bc,
+                                "name":           cat.get("name"),
+                                "manufacturer":   cat.get("manufacturer"),
+                                "min_price":      min_p,
+                                "max_price":      cat.get("max_price"),
+                                "cheapest_chain": cat.get("cheapest_chain"),
+                                "priciest_chain": cat.get("priciest_chain"),
+                                "all_chains":     cat.get("all_chains", []),
+                                "matched":        True,
+                                "box":            list(ln.box),
                             })
                 payload = {
                     "type": "result",
@@ -188,7 +239,7 @@ async def live_ocr(ws: WebSocket) -> None:
             except Exception as e:  # noqa: BLE001 — surface to client, keep loop alive
                 try:
                     await ws.send_text(json.dumps({"type": "error", "error": str(e)}))
-                except WebSocketDisconnect:
+                except (WebSocketDisconnect, RuntimeError):
                     return
 
     try:

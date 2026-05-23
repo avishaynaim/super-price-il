@@ -57,7 +57,18 @@ def _store_code(filename: str) -> str | None:
 
 class BinaprojectsScraper(BaseChainScraper):
     async def list_files(self, since: datetime | None = None) -> AsyncIterator[RemoteFile]:
+        from datetime import timedelta
         base = self.spec.portal_url.rstrip("/")
+        # Binaprojects resolves each file URL via a separate Download.aspx request.
+        # With no date filter (since=None) the portal can return hundreds of old
+        # entries, causing N sequential HTTP calls that stall or time out.
+        # Cap to 30 days max — binaprojects portals don't keep archives longer than
+        # that anyway, and per-store dedup in base.py picks the newest within the
+        # window.
+        effective_since = since
+        cutoff_30 = datetime.now(timezone.utc) - timedelta(days=30)
+        if effective_since is None or effective_since < cutoff_30:
+            effective_since = cutoff_30
         headers = {
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "X-Requested-With": "XMLHttpRequest",
@@ -75,7 +86,7 @@ class BinaprojectsScraper(BaseChainScraper):
             if not fname:
                 continue
             published = _parse_datefile(row.get("DateFile", ""))
-            if since and published and published < since:
+            if effective_since and published and published < effective_since:
                 continue
             # Resolve real URL via Download.aspx
             dl = await self.client.post(

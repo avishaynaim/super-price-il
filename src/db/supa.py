@@ -55,7 +55,8 @@ class _TableQuery:
         self._filters.append(("in", col, vals))
         return self
 
-    def not_(self) -> "_TableQuery":  # placeholder: .not_.is_("col","null")
+    @property
+    def not_(self) -> "_TableQuery":
         return _NotQuery(self)
 
     def is_(self, col: str, val: str) -> "_TableQuery":
@@ -238,6 +239,18 @@ def get_or_create_store_by_code(chain_id: int, store_code: str) -> int:
         row = cur.fetchone()
         if row:
             return row["id"]
+        # Zero-padding fallback: price files may use '0062' while Stores XML stored '62' or '062'.
+        if store_code.isdigit():
+            cur.execute(
+                """SELECT id FROM stores
+                   WHERE chain_id = %s
+                     AND store_code ~ '^[0-9]+$'
+                     AND store_code::bigint = %s::bigint""",
+                (chain_id, store_code),
+            )
+            row = cur.fetchone()
+            if row:
+                return row["id"]
         cur.execute(
             "INSERT INTO stores (chain_id, store_code) VALUES (%s, %s) RETURNING id",
             (chain_id, store_code),
@@ -334,6 +347,18 @@ def insert_observations(
 def delete_chain_current_prices(chain_id: int) -> None:
     with cursor() as cur:
         cur.execute("DELETE FROM current_prices WHERE chain_id = %s", (chain_id,))
+
+
+def delete_stale_chain_prices(chain_id: int, run_start: str) -> None:
+    """Remove current_prices rows for this chain that were NOT updated in the
+    current run (updated_at < run_start). Called only after a fully successful
+    price scrape so that failures leave previous prices intact."""
+    with cursor() as cur:
+        cur.execute(
+            """DELETE FROM current_prices
+               WHERE chain_id = %s AND updated_at < %s""",
+            (chain_id, run_start),
+        )
 
 
 # ---------- cache refresh ----------

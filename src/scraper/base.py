@@ -104,22 +104,21 @@ class BaseChainScraper(abc.ABC):
         kinds: set[str] | None = None,
         on_listed: "callable | None" = None,
         on_downloaded: "callable | None" = None,
-    ) -> list[DownloadedFile]:
-        """Authenticate, list files, download in parallel.
+    ) -> AsyncIterator[DownloadedFile]:
+        """Authenticate, list files, download in parallel; yield each as it lands.
 
-        Optional progress callbacks let the orchestrator (cli/backfill.py)
-        update the scrape_runs row in real time:
-          on_listed(total: int) — fired once after listing is complete.
-          on_downloaded(done: int, total: int) — fired after EACH file lands.
-        Both callbacks are optional and synchronous; failures are swallowed.
+        Yielding (instead of returning a list) lets the orchestrator parse
+        and insert one file at a time and drop the decompressed XML, keeping
+        peak memory ~one file (~3 MB) instead of the full chain (~1+ GB for
+        shufersal/mega). Required to survive proot's memory/thread limits.
+
+        Optional progress callbacks:
+          on_listed(total: int) — fired once after listing.
+          on_downloaded(done: int, total: int) — after EACH file lands.
         """
         await self.authenticate()
         sem = asyncio.Semaphore(concurrency)
 
-        # Materialize the file list first so we can announce a stable `total`
-        # to the orchestrator before any downloads start. This is critical for
-        # live progress: the dashboard's "running_now" turns yellow as soon as
-        # we know how many files we're going to fetch.
         try:
             gen = self.list_files(since=since, kinds=kinds)
         except TypeError:
@@ -132,12 +131,34 @@ class BaseChainScraper(abc.ABC):
             if limit and len(listed) >= limit:
                 break
 
+        # Per-store deduplication: keep only the latest published_at for each
+        # (kind, store_code) pair. With a wide --days window (e.g. 7), this
+        # ensures each store is represented by its newest available file —
+        # if today's missing for store X, yesterday's is used; etc.
+        # Files without store_code (Stores/StoresFull, header-only) are
+        # untouched.
+        keyed: dict[tuple, RemoteFile] = {}
+        keepalways: list[RemoteFile] = []
+        DEDUP_KINDS = {"PriceFull", "Price", "PromoFull", "Promo"}
+        for rf in listed:
+            if rf.store_code and rf.kind in DEDUP_KINDS:
+                key = (rf.kind, rf.store_code)
+                prev = keyed.get(key)
+                if prev is None:
+                    keyed[key] = rf
+                else:
+                    a, b = prev.published_at, rf.published_at
+                    if b is not None and (a is None or b > a):
+                        keyed[key] = rf
+            else:
+                keepalways.append(rf)
+        listed = list(keyed.values()) + keepalways
+
         if on_listed is not None:
             try: on_listed(len(listed))
             except Exception: pass
 
         done = 0
-        results: list[DownloadedFile] = []
         async def _fetch(rf: RemoteFile) -> DownloadedFile:
             nonlocal done
             async with sem:
@@ -151,10 +172,7 @@ class BaseChainScraper(abc.ABC):
         tasks = [asyncio.create_task(_fetch(rf)) for rf in listed]
         for t in asyncio.as_completed(tasks):
             try:
-                results.append(await t)
+                yield await t
             except Exception:
-                # Surface as a count drop — the orchestrator's parse loop will
-                # never see this file. We still count it via on_downloaded so
-                # the progress denominator includes failed downloads.
+                # Failed download — already reflected in `done` via callback.
                 pass
-        return results

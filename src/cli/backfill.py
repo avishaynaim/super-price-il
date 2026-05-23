@@ -6,13 +6,15 @@ Override with --days / --retain."""
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import threading
 from datetime import datetime, timedelta, timezone
 
 import httpx
 import typer
 from rich.console import Console
 
-from ..db import supa
+from ..db import router as supa  # router auto-falls-back to local SQLite
 from ..parser import pricefull, promofull, stores as stores_parser
 from ..scraper.base import RAW_ROOT
 from ..scraper.chains.shufersal import ShufersalScraper
@@ -138,19 +140,28 @@ def _stores_stale_chains(chains: list[str], stale_days: int) -> list[str]:
 
 def _filter_overdue(chains: list[str], threshold_days: int) -> list[str]:
     """Drop chains that finished a successful scrape within `threshold_days`."""
+    from ..db.pg import cursor as _cursor
     cutoff = (datetime.now(timezone.utc) - timedelta(days=threshold_days)).isoformat(timespec="seconds")
-    res = supa.sb().table("scrape_runs").select("chain_id,finished_at,chains(code)").eq("status", "ok").execute()
-    last_ok: dict[str, str] = {}
-    for r in (res.data or []):
-        code = r.get("chains", {}).get("code", "")
-        fa = r.get("finished_at", "")
-        if code and fa and fa > last_ok.get(code, ""):
-            last_ok[code] = fa
+    with _cursor() as cur:
+        # Portable SQL: no DISTINCT ON (Postgres-only), no ::TEXT cast.
+        # MAX(finished_at) per chain gives the same result as DISTINCT ON + ORDER BY DESC.
+        cur.execute(
+            """
+            SELECT ch.code, MAX(sr.finished_at) AS finished_at
+            FROM scrape_runs sr
+            JOIN chains ch ON ch.id = sr.chain_id
+            WHERE sr.status = 'ok'
+            GROUP BY ch.id, ch.code
+            HAVING MAX(sr.finished_at) >= %s
+            """,
+            (cutoff,),
+        )
+        last_ok = {r["code"]: r["finished_at"] for r in cur.fetchall() if r["finished_at"]}
     overdue, skipped = [], []
     for code in chains:
-        l = last_ok.get(code)
-        if l and l >= cutoff:
-            skipped.append((code, l))
+        fa = last_ok.get(code)
+        if fa and fa >= cutoff:
+            skipped.append((code, fa))
         else:
             overdue.append(code)
     if skipped:
@@ -219,25 +230,17 @@ async def run_chain(
             pass
 
     STORE_KINDS = {"Stores", "StoresFull"}
+    PRICE_KINDS = {"PriceFull", "Price"}
     # Stores files are published infrequently; always fetch all of them
     # regardless of the date window when doing a stores-only run.
     effective_since = None if (kinds and kinds <= STORE_KINDS) else since
 
-    try:
-        async with client_cm as client:
-            scraper = scraper_cls(spec, client)
-            files = await scraper.run(
-                since=effective_since, limit=limit, kinds=kinds,
-                on_listed=_on_listed, on_downloaded=_on_downloaded,
-            )
-    except Exception as exc:
-        msg = f"{type(exc).__name__}: {exc}"
-        console.print(f"[red]{code}: scrape failed — {msg}[/red]")
-        supa.scrape_run_finish(run_id, "error", 0, 0, 0, error_msg=msg)
-        return (0, 0)
-
-    # Wipe this chain's previous prices before inserting fresh ones (1-day retention).
-    supa.delete_chain_current_prices(chain_id)
+    # Capture run start BEFORE any inserts. Used at the end to delete rows whose
+    # updated_at is older than this — i.e., products not seen in the current run.
+    # Doing it this way (delete-AFTER instead of delete-BEFORE) means a crash or
+    # timeout during scraping leaves the previous run's prices intact rather than
+    # leaving the chain at 0.
+    run_start = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     files_ok = files_failed = rows_written = 0
     last_heartbeat = 0.0
@@ -245,40 +248,75 @@ async def run_chain(
     # Per-run product barcode→id cache so repeated products across files skip extra round-trips.
     product_cache: dict[str, int] = {}
 
-    for df in files:
-        try:
-            if df.remote.kind in {"Stores", "StoresFull"}:
-                for sr in stores_parser.parse(df.xml_bytes):
-                    supa.upsert_store(chain_id, sr)
-            elif df.remote.kind in {"PriceFull", "Price"}:
-                header, rows = pricefull.parse(df.xml_bytes)
-                store_code = df.remote.store_code or header.store_id
-                if not store_code:
+    try:
+        async with client_cm as client:
+            scraper = scraper_cls(spec, client)
+            # Stream: parse + insert each file as it lands, then drop xml_bytes.
+            # Keeps peak memory ~one file (~3 MB) instead of materializing the
+            # whole chain (~1+ GB for shufersal/mega) — required on proot.
+            async for df in scraper.run(
+                since=effective_since, limit=limit, kinds=kinds,
+                on_listed=_on_listed, on_downloaded=_on_downloaded,
+            ):
+                try:
+                    if df.remote.kind in {"Stores", "StoresFull"}:
+                        for sr in stores_parser.parse(df.xml_bytes):
+                            supa.upsert_store(chain_id, sr)
+                    elif df.remote.kind in {"PriceFull", "Price"}:
+                        header, rows = pricefull.parse(df.xml_bytes)
+                        store_code = df.remote.store_code or header.store_id
+                        if not store_code:
+                            files_failed += 1
+                            continue
+                        store_id = supa.get_or_create_store_by_code(chain_id, store_code)
+                        rows_written += supa.insert_observations(
+                            chain_id, store_id, rows, str(df.path), product_cache
+                        )
+                    elif df.remote.kind in {"PromoFull", "Promo"}:
+                        header, promo_rows = promofull.parse(df.xml_bytes)
+                        store_code = df.remote.store_code or header.store_id
+                        store_id = supa.get_or_create_store_by_code(chain_id, store_code) if store_code else None
+                        rows_written += supa.upsert_promotions(
+                            chain_id, store_id, list(promo_rows), product_cache
+                        )
+                    files_ok += 1
+                except Exception as e:
+                    console.print(f"[red]{df.remote.filename}: {e}[/red]")
                     files_failed += 1
-                    continue
-                store_id = supa.get_or_create_store_by_code(chain_id, store_code)
-                rows_written += supa.insert_observations(
-                    chain_id, store_id, rows, str(df.path), product_cache
-                )
-            elif df.remote.kind in {"PromoFull", "Promo"}:
-                header, promo_rows = promofull.parse(df.xml_bytes)
-                store_code = df.remote.store_code or header.store_id
-                store_id = supa.get_or_create_store_by_code(chain_id, store_code) if store_code else None
-                rows_written += supa.upsert_promotions(
-                    chain_id, store_id, list(promo_rows), product_cache
-                )
-            files_ok += 1
-        except Exception as e:
-            console.print(f"[red]{df.remote.filename}: {e}[/red]")
-            files_failed += 1
+                finally:
+                    df.xml_bytes = b""  # release decompressed buffer ASAP
+                    # Delete the gz on disk now that it's been processed; the
+                    # raw/ dir would otherwise grow ~200MB per full run.
+                    try:
+                        if df.path and df.path.exists():
+                            df.path.unlink()
+                    except Exception:
+                        pass
 
-        now_ts = datetime.now(timezone.utc).timestamp()
-        if now_ts - last_heartbeat >= HEARTBEAT_EVERY_SEC:
-            try:
-                supa.scrape_run_update(run_id, files_ok=files_ok, files_failed=files_failed, rows_written=rows_written)
-            except Exception:
-                pass
-            last_heartbeat = now_ts
+                now_ts = datetime.now(timezone.utc).timestamp()
+                if now_ts - last_heartbeat >= HEARTBEAT_EVERY_SEC:
+                    try:
+                        supa.scrape_run_update(run_id, files_ok=files_ok, files_failed=files_failed, rows_written=rows_written)
+                    except Exception:
+                        pass
+                    last_heartbeat = now_ts
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        console.print(f"[red]{code}: scrape failed — {msg}[/red]")
+        supa.scrape_run_finish(run_id, "error", files_ok, files_failed, rows_written, error_msg=msg)
+        return (files_ok, rows_written)
+
+    # Clean up prices that belong to this chain but were NOT updated in this run
+    # (products the chain stopped carrying, or stores that no longer exist).
+    # Only fires on full success (files_failed == 0) AND at least one file was
+    # processed (files_ok > 0). If the portal returned zero files (transient
+    # outage, portal temporarily empty), we keep existing prices rather than
+    # wiping them — an empty run must never blank a chain's data.
+    if files_failed == 0 and files_ok > 0 and (not kinds or kinds & PRICE_KINDS):
+        try:
+            supa.delete_stale_chain_prices(chain_id, run_start)
+        except Exception as e:
+            console.print(f"[dim]stale-price cleanup skipped: {e}[/dim]")
 
     status = "ok" if files_failed == 0 else "partial"
     supa.scrape_run_finish(run_id, status, files_ok, files_failed, rows_written)
@@ -288,6 +326,54 @@ async def run_chain(
     except Exception as e:
         console.print(f"[dim]cache refresh skipped: {e}[/dim]")
     return files_ok, rows_written
+
+
+_console_lock = threading.Lock()
+
+
+def _run_chain_in_thread(code: str, since: datetime, cap: int | None, kind_set: set[str] | None) -> tuple[int, int]:
+    """Run one chain's full scrape in a dedicated thread (each gets its own event loop)."""
+    return asyncio.run(run_chain(code, since, cap, kind_set))
+
+
+def _run_chains_parallel(
+    codes: list[str],
+    since: datetime,
+    cap: int | None,
+    kind_set: set[str] | None,
+    concurrency: int,
+    label: str = "",
+    per_chain_timeout: int = 7200,  # 2 hour hard cap per chain
+) -> None:
+    """Submit all chains to a thread pool; log results as they finish.
+    A per-chain timeout prevents one stuck chain (e.g., a hung HTTP request
+    on a flaky binaprojects host) from blocking the entire scrape."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(_run_chain_in_thread, c, since, cap, kind_set): c for c in codes}
+        # Use a per-future wait so a single hung chain doesn't stall the whole batch.
+        pending = set(futures)
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending, timeout=per_chain_timeout,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done and pending:
+                # Nothing finished within the window — skip the still-pending ones.
+                with _console_lock:
+                    skipped = ", ".join(futures[f] for f in pending)
+                    console.print(f"[yellow]timeout {per_chain_timeout}s: abandoning {skipped}{label}[/yellow]")
+                for f in pending:
+                    f.cancel()
+                break
+            for fut in done:
+                c = futures[fut]
+                try:
+                    files_ok, rows = fut.result()
+                    with _console_lock:
+                        console.print(f"[green]{c}{label}[/green]: files_ok={files_ok} rows={rows}")
+                except Exception as exc:
+                    with _console_lock:
+                        console.print(f"[red]{c}{label}: error — {exc}[/red]")
 
 
 @app.command()
@@ -308,13 +394,23 @@ def main(
         help="also do a stores-only pass for chains whose last Stores file is "
              "older than N days (0 = disabled).",
     ),
+    concurrency: int = typer.Option(
+        3,
+        help="number of chains to scrape in parallel (default 3; raise carefully — each chain opens 6 HTTP connections).",
+    ),
 ) -> None:
     # Seed chains into Supabase on every run (idempotent upsert).
     from ..scraper.registry import CHAINS as _CHAINS
     supa.seed_chains(_CHAINS)
 
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-    chains = list(SCRAPERS.keys()) if chain == "all" else [chain]
+    # days=0 → no date filter: list ALL portal files and let per-store dedup
+    # keep only the most recent per (kind, store_code) — even if weeks old.
+    since = None if days == 0 else (datetime.now(timezone.utc) - timedelta(days=days))
+    if chain == "all":
+        chains = list(SCRAPERS.keys())
+    else:
+        # support comma-separated: --chain shufersal,rami_levi
+        chains = [c.strip() for c in chain.split(",") if c.strip() in SCRAPERS]
     cap = limit or None
     kind_set = {k.strip() for k in kinds.split(",") if k.strip()} or None
 
@@ -324,8 +420,7 @@ def main(
     STORE_KINDS = {"Stores", "StoresFull"}
     is_stores_only = bool(kind_set and kind_set <= STORE_KINDS)
 
-    # Auto stores-refresh: before price runs, do a stores-only pass for
-    # chains whose last Stores file is older than refresh_stores_days.
+    # Auto stores-refresh: parallel pass for chains whose last Stores file is stale.
     if refresh_stores_days > 0 and not is_stores_only:
         stale = _stores_stale_chains(chains, refresh_stores_days)
         if stale:
@@ -333,25 +428,15 @@ def main(
                 f"[dim]stores refresh for {len(stale)} stale chain(s): "
                 f"{', '.join(stale)}[/dim]"
             )
-            for c in stale:
-                console.rule(f"[dim]{c} (stores refresh)")
-                try:
-                    files_ok, _ = asyncio.run(run_chain(c, since, cap, STORE_KINDS))
-                    console.print(f"{c} stores: files_ok={files_ok}")
-                except Exception as exc:
-                    console.print(f"[yellow]{c} stores refresh failed ({exc}), skipping[/yellow]")
+            _run_chains_parallel(stale, since, cap, STORE_KINDS, concurrency, label=" (stores)")
 
-    for c in chains:
-        console.rule(f"[bold]{c}")
-        try:
-            files_ok, rows = asyncio.run(run_chain(c, since, cap, kind_set))
-            console.print(f"{c}: files_ok={files_ok} rows={rows}")
-        except Exception as exc:
-            console.print(f"[red]{c}: unexpected error — {exc}[/red]")
+    console.print(f"[bold]scraping {len(chains)} chain(s) with concurrency={concurrency}[/bold]")
+    _run_chains_parallel(chains, since, cap, kind_set, concurrency)
 
     if not no_prune:
         from .prune import prune
-        prune()
+        effective_retain = retain if retain > 0 else 1
+        prune(retain_days=effective_retain)
 
 
 if __name__ == "__main__":

@@ -1,351 +1,394 @@
-// Live OCR: open the rear camera, stream frames over a WebSocket to /api/ws/live-ocr,
-// draw bounding boxes over the live <video> with kind-colored highlights, and tick
-// a side list of detected items as new barcodes are matched against the catalog.
+// Live scanner — WebSocket OCR mode.
 //
-// Throttling: capture at most ~1 frame/sec (server may take 0.5-2s/frame on Termux),
-// drop overlapping captures, and reuse the same JPEG-encoded canvas to keep memory flat.
+// Architecture:
+//   1. Camera feed → canvas frame capture every ~2s
+//   2. Frame sent as JPEG base64 over WebSocket to /ws/live-ocr
+//   3. Server runs RapidOCR, extracts printed number codes (729xxxxxxxxxx)
+//   4. Server replies with matched products + prices from local DB
+//
+// This handles printed number codes on receipts/labels, not just stripe barcodes.
 
 import { shekel, escapeHtml, toast } from "./ui.js";
+import { openProduct } from "./product.js";
+import { addToBasket } from "./receipt.js";
 
-const FRAME_INTERVAL_MS = 1100;
-const JPEG_QUALITY      = 0.7;
-const CAPTURE_LONG_SIDE = 960;     // server downscales further to 1600 max anyway
-const BOX_FADE_MS       = 2400;
-const BOX_KEEP_KINDS    = new Set(["barcode"]);  // boxes that persist instead of fade
-const FRAME_WATCHDOG_MS = 25000;   // if a frame doesn't return in this window, reset
-
+const DEBOUNCE_MS       = 8000;
+const CAPTURE_MS_RAPID  = 2000;   // RapidOCR ~1-2s — auto scan
 const $ = id => document.getElementById(id);
 
-let stream      = null;
-let ws          = null;
-let frameTimer  = null;
-let frameSeq    = 0;
-let inFlight    = false;
-let inFlightSince = 0;
-let framesSent  = 0;
-let framesReceived = 0;
-let lastVideoSize = { w: 0, h: 0 };
-const items    = new Map();        // barcode → item record
-const liveBoxes = [];              // { id, box, kind, text, expires, el }
+// ── debug logger ──────────────────────────────────────────────────────────────
+const _dbgLines = [];
+function dbg(...args) {
+  const msg = args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ");
+  console.log("[live]", msg);
+  _dbgLines.push(msg);
+  if (_dbgLines.length > 40) _dbgLines.shift();
+  const el = $("live-debug");
+  if (el) { el.textContent = _dbgLines.join("\n"); el.scrollTop = el.scrollHeight; }
+}
 
+let stream       = null;
+let ws           = null;
+let captureTimer = null;
+const items      = new Map();   // barcode → item record
+const recent     = new Map();   // barcode → last-seen timestamp
+
+// ── status ────────────────────────────────────────────────────────────────────
 function setStatus(text, kind = "") {
   const el = $("live-status");
-  if (!el) return;
-  el.textContent = text;
-  el.className = "live-status " + kind;
+  if (el) { el.textContent = text; el.className = "live-status " + kind; }
 }
 
-function svgRoot() {
-  return $("live-overlay");
-}
+// ── capture one frame and send to server OCR ──────────────────────────────────
+function captureFrame() {
+  const v = $("live-video");
+  if (!v?.videoWidth) { dbg("capture: video not ready"); return; }
+  if (!ws || ws.readyState !== WebSocket.OPEN) { dbg("capture: WS not open, state=", ws?.readyState); return; }
 
-function videoEl() {
-  return $("live-video");
-}
-
-function ensureSvgViewbox() {
-  const v = videoEl();
-  const w = v.videoWidth || 1280;
-  const h = v.videoHeight || 720;
-  const svg = svgRoot();
-  if (lastVideoSize.w !== w || lastVideoSize.h !== h) {
-    svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
-    svg.setAttribute("preserveAspectRatio", "none");
-    lastVideoSize = { w, h };
-  }
-}
-
-function captureFrameAsBlob() {
-  const v = videoEl();
-  if (!v.videoWidth) return null;
-  const long = Math.max(v.videoWidth, v.videoHeight);
-  const scale = long > CAPTURE_LONG_SIDE ? CAPTURE_LONG_SIDE / long : 1;
-  const w = Math.round(v.videoWidth * scale);
+  const mode  = $("live-ocr-mode")?.value || "rapid";
+  // Claude gets full resolution for best recall; RapidOCR downscaled for speed
+  const maxPx = mode === "claude" ? 1920 : 1000;
+  const scale = Math.min(1, maxPx / Math.max(v.videoWidth, v.videoHeight));
+  const w = Math.round(v.videoWidth  * scale);
   const h = Math.round(v.videoHeight * scale);
-  const cvs = document.createElement("canvas");
-  cvs.width = w; cvs.height = h;
+
+  const cvs = Object.assign(document.createElement("canvas"), { width: w, height: h });
   cvs.getContext("2d").drawImage(v, 0, 0, w, h);
-  return new Promise(resolve => cvs.toBlob(resolve, "image/jpeg", JPEG_QUALITY));
+  const b64 = cvs.toDataURL("image/jpeg", mode === "claude" ? 0.92 : 0.85);
+  const id  = Date.now().toString();
+
+  dbg(`→ frame ${id} ${w}x${h} (${Math.round(b64.length/1024)}KB) mode=${mode}`);
+  ws.send(JSON.stringify({ type: "frame", image: b64, id, mode }));
 }
 
-function blobToBase64(blob) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload  = () => res(r.result.toString().split(",", 2)[1]);
-    r.onerror = () => rej(r.error);
-    r.readAsDataURL(blob);
-  });
-}
+// ── handle server OCR result ──────────────────────────────────────────────────
+function onWsMessage(ev) {
+  let msg;
+  try { msg = JSON.parse(ev.data); } catch { return; }
 
-// ---------- WebSocket ----------
-
-function openWs() {
-  return new Promise((resolve, reject) => {
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const w = new WebSocket(`${proto}//${location.host}/api/ws/live-ocr`);
-    w.onopen = () => resolve(w);
-    w.onerror = e => reject(e);
-    w.onclose = () => {
-      setStatus("WebSocket נסגר", "warn");
-    };
-    w.onmessage = ev => {
-      let m;
-      try { m = JSON.parse(ev.data); } catch { return; }
-      if (m.type === "result") onResult(m);
-      else if (m.type === "error") setStatus(`שגיאה: ${m.error}`, "err");
-      else if (m.type === "reset_ack") {
-        items.clear(); renderItems(); setStatus("אופס — מתחילים מחדש", "ok");
-      }
-    };
-  });
-}
-
-// ---------- frame loop ----------
-
-async function tick() {
-  // Watchdog: if a frame hasn't returned in FRAME_WATCHDOG_MS, free the slot.
-  // Server-side OCR sometimes stalls (long PIL decode); without this the UI
-  // would freeze on "מצולם בזמן אמת" indefinitely.
-  if (inFlight && performance.now() - inFlightSince > FRAME_WATCHDOG_MS) {
-    setStatus("פריים אחרון לא חזר — שולח מחדש", "warn");
-    inFlight = false;
-  }
-  if (inFlight) return;
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    setStatus("WebSocket לא פתוח", "warn");
+  if (msg.type === "error") {
+    dbg("WS error from server:", msg.error);
+    _reenableScanBtn();
     return;
   }
-  let blob = null;
-  try {
-    blob = await captureFrameAsBlob();
-  } catch (e) {
-    console.error("capture error", e);
-    setStatus("שגיאה בלכידת פריים: " + (e.message || e), "err");
+  if (msg.type === "reset_ack") { dbg("WS reset ack"); return; }
+  if (msg.type === "processing") {
+    dbg(`Claude מעבד… ${msg.elapsed_s}s`);
+    setStatus(`🧠 Claude מעבד… ${msg.elapsed_s} שניות`, "ok");
+    const btn = $("live-scan-now");
+    if (btn && !btn.hidden) btn.textContent = `⏳ ${msg.elapsed_s}s…`;
     return;
   }
-  if (!blob) {
-    // Video not ready yet — try again on the next tick. Crucially, do NOT
-    // toggle inFlight, otherwise we'd lock ourselves out forever.
-    setStatus("ממתין לוידאו…", "");
-    return;
-  }
-  inFlight = true;
-  inFlightSince = performance.now();
-  try {
-    const b64 = await blobToBase64(blob);
-    const id  = "f" + (++frameSeq);
-    framesSent++;
-    ws.send(JSON.stringify({ type: "frame", id, image: b64 }));
-    setStatus(`שולח פריים #${framesSent} · ${(blob.size/1024)|0} KB · מעבד…`, "");
-  } catch (e) {
-    console.error("send error", e);
-    inFlight = false;
-    setStatus("שגיאה בשליחה: " + (e.message || e), "err");
-  }
-}
+  if (msg.type !== "result") return;
 
-// ---------- overlay ----------
+  dbg(`← result id=${msg.id} latency=${msg.latency_ms}ms lines=${msg.lines?.length} new_items=${msg.items?.length}`);
 
-function kindClass(kind) {
-  return "lb lb-" + kind;
-}
+  const now = Date.now();
+  let gotNew = false;
 
-function renderBoxes(lines) {
-  const svg = svgRoot();
-  ensureSvgViewbox();
-  const w = lastVideoSize.w || 1, h = lastVideoSize.h || 1;
-  const now = performance.now();
-  // 1) age out the existing boxes
-  for (let i = liveBoxes.length - 1; i >= 0; i--) {
-    const b = liveBoxes[i];
-    if (b.expires && now > b.expires) {
-      b.el.remove();
-      liveBoxes.splice(i, 1);
+  for (const it of msg.items || []) {
+    const bc = it.barcode;
+    if (!bc) continue;
+    if (recent.has(bc) && now - recent.get(bc) < DEBOUNCE_MS) {
+      dbg("SKIP debounce:", bc); continue;
     }
-  }
-  // 2) add new boxes
-  for (const ln of lines) {
-    const [x, y, bw, bh] = ln.box;
-    const px = x * w, py = y * h, pw = bw * w, ph = bh * h;
-    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-    g.setAttribute("class", kindClass(ln.kind));
-    const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-    r.setAttribute("x", px.toFixed(1));
-    r.setAttribute("y", py.toFixed(1));
-    r.setAttribute("width",  Math.max(2, pw).toFixed(1));
-    r.setAttribute("height", Math.max(2, ph).toFixed(1));
-    r.setAttribute("rx", "3");
-    g.appendChild(r);
-    if (ln.kind !== "text") {
-      const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      t.setAttribute("x", (px + pw + 4).toFixed(1));
-      t.setAttribute("y", (py + ph * 0.85).toFixed(1));
-      t.setAttribute("class", "lb-label");
-      t.textContent = ln.text;
-      g.appendChild(t);
-    }
-    svg.appendChild(g);
-    liveBoxes.push({
-      id: ln.text + ":" + px.toFixed(0) + "," + py.toFixed(0),
-      box: ln.box,
-      kind: ln.kind,
-      text: ln.text,
-      expires: BOX_KEEP_KINDS.has(ln.kind) ? 0 : now + BOX_FADE_MS,
-      el: g,
+    recent.set(bc, now);
+    if (items.has(bc)) { dbg("SKIP already shown:", bc); continue; }
+
+    dbg("NEW item:", bc, it.name, it.min_price);
+    items.set(bc, {
+      barcode:        bc,
+      name:           it.name || bc,
+      manufacturer:   it.manufacturer,
+      min_price:      it.min_price,
+      max_price:      it.max_price,
+      cheapest_chain: it.cheapest_chain,
+      priciest_chain: it.priciest_chain,
+      chains:         it.all_chains || [],
+      matched:        it.matched,
     });
+    gotNew = true;
+
+    if (it.matched) {
+      const saving = (it.max_price && it.min_price) ? it.max_price - it.min_price : 0;
+      toast(
+        `✓ ${it.name || bc}  ${shekel(it.min_price)} @ ${it.cheapest_chain}` +
+        (saving > 0.5 ? `  (חסוך ₪${saving.toFixed(2)})` : ""),
+        "ok", 4000
+      );
+    } else {
+      toast(`קוד ${bc} — לא נמצא במאגר`, "warn", 2500);
+    }
   }
-  // cap total to avoid DOM blowup
-  while (liveBoxes.length > 80) {
-    liveBoxes.shift().el.remove();
-  }
+
+  if (gotNew) { renderItems(); updateTotals(); }
+  _reenableScanBtn();
+
+  const latMs = msg.latency_ms;
+  const found = items.size;
+  setStatus(found
+    ? `✓ נמצאו ${found} מוצרים (${(latMs/1000).toFixed(1)}s)`
+    : `סריקה הושלמה — לא נמצאו קודים (${(latMs/1000).toFixed(1)}s)`, found ? "ok" : "");
 }
 
-// ---------- side list ----------
-
-function onResult(m) {
-  inFlight = false;
-  framesReceived++;
-  const nLines = (m.lines || []).length;
-  const byKind = (m.lines || []).reduce((acc, l) => {
-    acc[l.kind] = (acc[l.kind] || 0) + 1; return acc;
-  }, {});
-  const bcCount = byKind.barcode || 0;
-  const newBc = (m.items || []).length;
-  const tot   = m.totals || {};
-
-  // Clear, actionable status. When 0 lines, hint at common causes.
-  let status = "ok";
-  let txt = `פריים #${framesReceived} · ${m.latency_ms} ms · ${nLines} שורות`;
-  if (bcCount) txt += ` · ברקודים: ${bcCount}`;
-  if (newBc)   txt += ` · חדשים: ${newBc}`;
-  if (nLines === 0) {
-    status = "warn";
-    txt += " · אין טקסט בפריים — קרב את המצלמה לקבלה ושמור על תאורה";
-  } else if (bcCount === 0) {
-    status = "warn";
-    txt += " · אין ברקודים — מקד על השורות התחתונות של הקבלה";
-  }
-  setStatus(txt, status);
-  renderBoxes(m.lines || []);
-  for (const it of m.items || []) {
-    items.set(it.barcode, it);
-  }
-  renderItems();
-  $("live-totals").innerHTML =
-    `מוצרים מזוהים: <b>${tot.distinct_items ?? 0}</b> · ` +
-    `סל מוערך: <b>${shekel(tot.basket_total)}</b> · ` +
-    `<span class="muted">פריימים נשלחו ${framesSent} · נקלטו ${framesReceived}</span>`;
-}
-
+// ── render ─────────────────────────────────────────────────────────────────────
 function renderItems() {
   const root = $("live-items");
   if (!items.size) {
-    root.innerHTML = '<div class="empty">עדיין לא זוהו מוצרים — כוון את המצלמה לקבלה</div>';
+    root.innerHTML = '<div class="empty">הצב את קוד המוצר בתוך המסגרת</div>';
     return;
   }
-  const rows = [...items.values()].reverse();
-  root.innerHTML = rows.map(it => {
-    const matched = it.matched;
-    const cls = matched ? "live-item live-item-ok" : "live-item live-item-miss";
-    const name = matched ? escapeHtml(it.name || "") : "ברקוד לא ידוע";
-    const sub  = matched
-      ? escapeHtml(it.manufacturer || "")
-      : "המוצר לא נמצא בקטלוג";
+  root.innerHTML = [...items.values()].reverse().map(it => {
+    if (!it.matched) {
+      return `<div class="live-item live-item-miss">
+        <div class="li-main"><div class="li-name">${escapeHtml(it.barcode)}</div>
+        <div class="li-sub">לא נמצא במאגר</div></div></div>`;
+    }
+    const saving = (it.max_price && it.min_price) ? it.max_price - it.min_price : 0;
+    const savingHtml = saving > 0.5
+      ? `<span class="savings-pos">חסוך ₪${saving.toFixed(2)}</span>` : "";
+    const itemData = JSON.stringify({
+      barcode: it.barcode, name: it.name, price: it.min_price, chain: it.cheapest_chain
+    }).replace(/"/g, "&quot;");
+
     return `
-      <div class="${cls}">
+      <div class="live-item live-item-ok live-item-click" data-barcode="${escapeHtml(it.barcode)}"
+           role="button" tabindex="0">
         <div class="li-main">
-          <div class="li-name">${name}</div>
-          <div class="li-sub">${sub} <span class="li-bc">${escapeHtml(it.barcode)}</span></div>
+          <div class="li-name">${escapeHtml(it.name)}</div>
+          <div class="li-sub">${escapeHtml(it.manufacturer || "")}
+            <span class="li-bc">${escapeHtml(it.barcode)}</span></div>
+          <div class="li-prices">
+            <span class="li-best">
+              <b>${shekel(it.min_price)}</b>
+              <span class="chain-tag">${escapeHtml(it.cheapest_chain || "")}</span>
+            </span>
+            ${it.max_price !== it.min_price ? `
+            <span class="li-worst">
+              ${shekel(it.max_price)}
+              <span class="chain-tag chain-tag-hi">${escapeHtml(it.priciest_chain || "")}</span>
+            </span>` : ""}
+            ${savingHtml}
+          </div>
         </div>
-        <div class="li-price">${matched && it.min_price ? shekel(it.min_price) : ""}</div>
-      </div>
-    `;
+        <div class="li-actions">
+          <div class="li-price">${shekel(it.min_price)} <span class="li-arrow">›</span></div>
+          <button class="btn-add-item li-add" data-item="${itemData}">+ סל</button>
+        </div>
+      </div>`;
   }).join("");
+
+  root.querySelectorAll(".live-item-click").forEach(el => {
+    el.addEventListener("click", e => {
+      if (e.target.closest(".li-add")) return;
+      openProduct(el.dataset.barcode);
+    });
+  });
+  root.querySelectorAll(".li-add").forEach(btn => {
+    btn.addEventListener("click", e => {
+      e.stopPropagation();
+      try { addToBasket(JSON.parse(btn.dataset.item)); } catch {}
+    });
+  });
 }
 
-// ---------- start/stop ----------
+function updateTotals() {
+  const matched = [...items.values()].filter(it => it.matched);
+  const total    = matched.reduce((s, it) => s + (it.min_price || 0), 0);
+  const maxTotal = matched.reduce((s, it) => s + (it.max_price || it.min_price || 0), 0);
+  const saving   = maxTotal - total;
+  $("live-totals").innerHTML =
+    `מוצרים: <b>${matched.length}</b> · סל מינימום: <b>${shekel(total)}</b>` +
+    (saving > 1 ? ` · <span class="savings-pos">חיסכון אפשרי: ${shekel(saving)}</span>` : "");
+}
 
+// ── start / stop / reset ──────────────────────────────────────────────────────
 async function start() {
   if (stream) return;
-  setStatus("מבקש גישה למצלמה…", "");
+  setStatus("מפעיל מצלמה…", "");
+  dbg("start()");
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    const isSecure = location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1";
+    const msg = isSecure
+      ? "המצלמה אינה נתמכת בדפדפן זה"
+      : "יש לפתוח את האפליקציה דרך localhost:8000 (לא דרך כתובת IP) כדי לאפשר גישה למצלמה";
+    dbg("mediaDevices unavailable. secure=", isSecure, "protocol=", location.protocol, "host=", location.hostname);
+    setStatus(msg, "err");
+    return;
+  }
+
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: {
-        facingMode: { ideal: "environment" },
-        width:  { ideal: 1280 },
-        height: { ideal: 720 },
-      },
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
     });
+    const track = stream.getVideoTracks()[0];
+    const s = track.getSettings();
+    dbg(`Camera: ${s.width}x${s.height} facing=${s.facingMode} label=${track.label}`);
   } catch (e) {
-    setStatus("גישה למצלמה נדחתה: " + (e.message || e.name), "err");
+    dbg("Camera error:", e.name, e.message);
+    setStatus("שגיאת מצלמה: " + (e.message || e.name), "err");
     return;
   }
-  const v = videoEl();
+
+  const v = $("live-video");
   v.srcObject = stream;
-  await v.play().catch(() => {});
-  setStatus("מתחבר לשרת…", "");
-  try {
-    ws = await openWs();
-  } catch (e) {
-    setStatus("WebSocket נכשל", "err");
-    return;
-  }
-  setStatus("מצולם בזמן אמת — סרוק קבלה", "ok");
-  $("live-start").hidden = true;
-  $("live-stop").hidden = false;
-  $("live-reset").hidden = false;
-  framesSent = 0;
-  framesReceived = 0;
-  inFlight = false;
-  // Fire first tick almost immediately so the user sees activity right away,
-  // then settle into the steady cadence.
-  setTimeout(tick, 250);
-  frameTimer = setInterval(tick, FRAME_INTERVAL_MS);
+  await v.play().catch(e => dbg("play() error:", e.message));
+  dbg(`Video playing: ${v.videoWidth}x${v.videoHeight}`);
+
+  // Connect WebSocket to server OCR
+  const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl   = `${wsProto}//${location.host}/api/ws/live-ocr`;
+  dbg("Connecting WS:", wsUrl);
+  ws = new WebSocket(wsUrl);
+  ws.onopen    = () => { dbg("WS open ✓"); setStatus("מחובר — כוון את קוד המוצר למסגרת", "ok"); };
+  ws.onerror   = (e) => { dbg("WS error:", JSON.stringify(e)); setStatus("שגיאת חיבור OCR", "err"); };
+  ws.onclose   = (e) => { dbg("WS closed code=", e.code, e.reason); };
+  ws.onmessage = onWsMessage;
+
+  $("live-start").hidden    = true;
+  $("live-stop").hidden     = false;
+  $("live-reset").hidden    = false;
+  $("live-ocr-mode").hidden = false;
+  $("live-summary").hidden  = true;
+  $("live-hint")?.classList.add("hidden");
+  $("live-target")?.classList.add("active");
+  $("live-scanline")?.classList.add("active");
+
+  const applyMode = (mode) => {
+    if (captureTimer) { clearInterval(captureTimer); captureTimer = null; }
+    if (mode === "claude") {
+      // Manual mode — user presses "סרוק עכשיו"
+      $("live-scan-now").hidden = false;
+      setStatus("כוון את הקבלה למסגרת ולחץ סרוק עכשיו", "ok");
+    } else {
+      // Auto mode — scan every 2s
+      $("live-scan-now").hidden = true;
+      captureTimer = setInterval(captureFrame, CAPTURE_MS_RAPID);
+      setStatus("סורק אוטומטית…", "ok");
+    }
+    dbg("mode applied:", mode);
+  };
+
+  applyMode($("live-ocr-mode")?.value || "rapid");
+
+  $("live-ocr-mode")?.addEventListener("change", () => {
+    const mode = $("live-ocr-mode")?.value;
+    dbg("Mode changed to:", mode);
+    if (stream) applyMode(mode);
+  });
+}
+
+function scanNow() {
+  const btn = $("live-scan-now");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = "⏳ מעבד…";
+  setStatus("שולח לסריקה…", "ok");
+  captureFrame();
+}
+
+function _reenableScanBtn() {
+  const btn = $("live-scan-now");
+  if (!btn || btn.hidden) return;
+  btn.disabled = false;
+  btn.textContent = "📸 סרוק עכשיו";
 }
 
 function stop() {
-  if (frameTimer) { clearInterval(frameTimer); frameTimer = null; }
-  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-  ws = null;
-  if (stream) {
-    for (const t of stream.getTracks()) t.stop();
-    stream = null;
-  }
-  videoEl().srcObject = null;
-  // clear overlay boxes
-  while (liveBoxes.length) liveBoxes.shift().el.remove();
-  $("live-start").hidden = false;
-  $("live-stop").hidden = true;
-  setStatus("הופסק", "");
+  if (captureTimer) { clearInterval(captureTimer); captureTimer = null; }
+  if (ws)           { ws.close(); ws = null; }
+  if (stream)       { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  const v = $("live-video");
+  if (v) v.srcObject = null;
+  $("live-start").hidden    = false;
+  $("live-stop").hidden     = true;
+  $("live-reset").hidden    = true;
+  $("live-scan-now").hidden = true;
+  $("live-ocr-mode").hidden = true;
+  $("live-hint")?.classList.remove("hidden");
+  $("live-target")?.classList.remove("active");
+  $("live-scanline")?.classList.remove("active");
+  showSummary();
+  setStatus("", "");
+  dbg("stopped");
+}
+
+function showSummary() {
+  const el = $("live-summary");
+  if (!el) return;
+  const matched = [...items.values()].filter(it => it.matched);
+  if (!matched.length) { el.hidden = true; return; }
+  const total    = matched.reduce((s, it) => s + (it.min_price || 0), 0);
+  const maxTotal = matched.reduce((s, it) => s + (it.max_price || it.min_price || 0), 0);
+  const saving   = maxTotal - total;
+  el.hidden = false;
+  el.innerHTML = `
+    <div class="summary-box">
+      <div class="summary-title">✓ סריקה הושלמה</div>
+      <div class="summary-row"><span>מוצרים שזוהו</span><b>${matched.length}</b></div>
+      <div class="summary-row"><span>סל מינימום</span><b>${shekel(total)}</b></div>
+      ${saving > 1 ? `<div class="summary-row savings-pos"><span>חיסכון אפשרי</span><b>${shekel(saving)}</b></div>` : ""}
+    </div>`;
 }
 
 function reset() {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "reset" }));
-  }
-  items.clear();
-  framesSent = 0;
-  framesReceived = 0;
-  renderItems();
-  while (liveBoxes.length) liveBoxes.shift().el.remove();
-  $("live-totals").textContent = "";
+  items.clear(); recent.clear(); renderItems(); updateTotals();
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "reset" }));
+  dbg("reset");
 }
 
-// ---------- public init ----------
+// ── product text search ───────────────────────────────────────────────────────
+function initLiveSearch() {
+  const form    = $("live-search-form");
+  const input   = $("live-search-input");
+  const results = $("live-search-results");
+  if (!form) return;
 
+  const { api } = { api: (url, params) => fetch(url + (params ? "?" + new URLSearchParams(params) : "")).then(r => r.json()) };
+
+  form.addEventListener("submit", async e => {
+    e.preventDefault();
+    const q = (input.value || "").trim();
+    if (!q) return;
+    results.hidden = false;
+    results.innerHTML = '<div class="ls-row ls-loading">מחפש…</div>';
+    try {
+      const rows = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=8`).then(r => r.json());
+      if (!rows.length) { results.innerHTML = '<div class="ls-row ls-empty">לא נמצאו מוצרים</div>'; return; }
+      results.innerHTML = rows.map(r => `
+        <div class="ls-row" data-barcode="${escapeHtml(r.barcode)}" role="option" tabindex="0">
+          <div class="ls-name">${escapeHtml(r.name || r.barcode)}</div>
+          <div class="ls-meta">${shekel(r.min_price)} – ${shekel(r.max_price)}
+            <span class="ls-chains">${r.chains_with_price} רשתות</span></div>
+        </div>`).join("");
+      results.querySelectorAll(".ls-row[data-barcode]").forEach(el => {
+        el.addEventListener("click", () => { results.hidden = true; input.value = ""; openProduct(el.dataset.barcode); });
+      });
+    } catch (err) {
+      results.innerHTML = `<div class="ls-row ls-empty">שגיאה</div>`;
+    }
+  });
+  document.addEventListener("click", e => {
+    if (!form.contains(e.target) && !results.contains(e.target)) results.hidden = true;
+  });
+}
+
+// ── public init ───────────────────────────────────────────────────────────────
 export function initLive() {
-  if (!$("live-start")) return;   // tab not present
+  if (!$("live-start")) return;
   $("live-start").addEventListener("click", start);
   $("live-stop").addEventListener("click", stop);
   $("live-reset").addEventListener("click", reset);
+  $("live-scan-now").addEventListener("click", scanNow);
+  initLiveSearch();
   renderItems();
-  // Stop the camera + WS when leaving the tab to save battery and CPU.
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden && stream) stop();
-  });
+  document.addEventListener("visibilitychange", () => { if (document.hidden && stream) stop(); });
   window.addEventListener("hashchange", () => {
     const tab = (location.hash || "").replace(/^#\/?/, "").split("/")[0];
-    if (tab && tab !== "live" && stream) stop();
+    if (tab === "live") { if (!stream) start(); }
+    else if (stream) stop();
   });
+  if ((location.hash || "").replace(/^#\/?/, "").split("/")[0] === "live") start();
 }
