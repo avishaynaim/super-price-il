@@ -26,32 +26,57 @@ def _now_iso() -> str:
 
 
 _tls = threading.local()
+_init_lock = threading.Lock()
+
+# Numbered migrations, applied in order and recorded in schema_version.
+# Version 1 = schema.sql + spilled table (all idempotent CREATE ... IF NOT EXISTS).
+# Add future schema changes as new entries (2, 3, ...); never edit applied ones.
+# `spilled` tracks which scrape rows came from the spillover (so we know what
+# to push when supa is back).
+_SPILLED_SQL = """
+    CREATE TABLE IF NOT EXISTS spilled (
+        id INTEGER PRIMARY KEY,
+        kind TEXT NOT NULL,           -- 'observation','store','promo','run'
+        created_at TEXT NOT NULL,
+        synced_at TEXT,
+        ref_json TEXT NOT NULL        -- JSON payload for sync
+    );
+    CREATE INDEX IF NOT EXISTS idx_spilled_unsynced ON spilled(synced_at) WHERE synced_at IS NULL;
+"""
+
+
+def _migrations():
+    schema_sql = (Path(__file__).parent / "schema.sql").read_text()
+    return [(1, schema_sql + "\n" + _SPILLED_SQL)]
+
+
+def _apply_migrations(conn):
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS schema_version ("
+        "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);"
+    )
+    current = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()[0]
+    for version, sql in _migrations():
+        if version > current:
+            # Scripts are idempotent, so a crash or a race with another process
+            # before the version row is written just re-runs them harmlessly.
+            conn.executescript(sql)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)",
+                (version, _now_iso()),
+            )
+            conn.commit()
 
 
 def _open_db():
     LOCAL_DB.parent.mkdir(parents=True, exist_ok=True)
-    fresh = (not LOCAL_DB.exists()) or LOCAL_DB.stat().st_size == 0
     # timeout=30: wait up to 30s for a write lock instead of failing immediately.
     # busy_timeout via PRAGMA so readers don't block behind scraper writes.
     conn = sqlite3.connect(LOCAL_DB, timeout=30)
     try:
         conn.executescript("PRAGMA foreign_keys=OFF; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;")
-        if fresh:
-            schema_sql = (Path(__file__).parent / "schema.sql").read_text()
-            # Strip Postgres-only bits (FK ON, journal mode handled above)
-            conn.executescript(schema_sql)
-            # Track which scrape rows came from the spillover (so we know what
-            # to push when supa is back).
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS spilled (
-                    id INTEGER PRIMARY KEY,
-                    kind TEXT NOT NULL,           -- 'observation','store','promo','run'
-                    created_at TEXT NOT NULL,
-                    synced_at TEXT,
-                    ref_json TEXT NOT NULL        -- JSON payload for sync
-                );
-                CREATE INDEX IF NOT EXISTS idx_spilled_unsynced ON spilled(synced_at) WHERE synced_at IS NULL;
-            """)
+        with _init_lock:
+            _apply_migrations(conn)
         conn.commit()
     except BaseException:
         conn.close()
