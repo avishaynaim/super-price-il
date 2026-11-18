@@ -310,6 +310,52 @@ def stores(
     radius_km: float | None = Query(None, ge=0, le=500),
     limit: int = Query(500, le=5000),
 ):
+    if os.environ.get("SUPER_PRICE_LOCAL_ONLY", "").strip() == "1":
+        import sqlite3
+        from src.db.local import LOCAL_DB
+
+        l_where: list[str] = []
+        l_args: list = []
+        if chain:
+            l_where.append("ch.code = ?")
+            l_args.append(chain)
+        elif chains:
+            l_codes = [c.strip() for c in chains.split(",") if c.strip()]
+            if l_codes:
+                l_where.append(f"ch.code IN ({','.join(['?'] * len(l_codes))})")
+                l_args += l_codes
+        l_cities = compute_city_spellings(city, lat, lng, radius_km)
+        if l_cities is not None:
+            if not l_cities:
+                return []
+            l_where.append(f"s.city IN ({','.join(['?'] * len(l_cities))})")
+            l_args += l_cities
+        l_sql = f"""
+            SELECT s.id, s.store_code, s.name, s.city, s.address,
+                   ch.code AS chain_code, ch.name_he AS chain_name_he
+            FROM stores s
+            JOIN chains ch ON ch.id = s.chain_id
+            {("WHERE " + " AND ".join(l_where)) if l_where else ""}
+            ORDER BY s.city
+            LIMIT ?
+        """
+        l_args.append(limit)
+        conn = sqlite3.connect(LOCAL_DB)
+        conn.row_factory = sqlite3.Row
+        try:
+            l_rows = [dict(r) for r in conn.execute(l_sql, l_args).fetchall()]
+        finally:
+            conn.close()
+        return [StoreOut(
+            id=r["id"],
+            chain_code=r["chain_code"],
+            chain_name_he=r["chain_name_he"],
+            store_code=r["store_code"],
+            name=r.get("name"),
+            city=r.get("city"),
+            address=r.get("address"),
+        ) for r in l_rows]
+
     from ..db.pg import cursor as _cursor
 
     where_parts: list[str] = []
