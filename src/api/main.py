@@ -11,6 +11,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+import logging
 import os
 
 from fastapi import FastAPI, HTTPException, Query
@@ -24,6 +25,8 @@ from .live_ocr import live_ocr_router
 from .nl import nl_router
 from .receipts import receipts_router
 from .stats import stats_router
+
+log = logging.getLogger(__name__)
 
 APP_VERSION = "0.4"
 
@@ -112,14 +115,14 @@ async def _start_cache_refresher():
                 result = _local_health()
                 # _local_health already updates its own globals
             except Exception:
-                pass
+                log.exception("cache-refresher: health refresh failed")
             # retailers-status cache
             try:
                 rows = _stats._retailers_status_local()
                 _stats._retailers_cache = rows
                 _stats._retailers_cache_ts = _time.monotonic()
             except Exception:
-                pass
+                log.exception("cache-refresher: retailers-status refresh failed")
             _time.sleep(10)
 
     t = threading.Thread(target=_refresh_loop, daemon=True, name="cache-refresher")
@@ -138,7 +141,10 @@ async def lookup_barcode(barcode: str) -> dict:
     Used by the live ZXing scanner so no WebSocket or OCR is needed.
     """
     from ..db.price_index import price_index
-    info = price_index.lookup(barcode)
+    try:
+        info = price_index.lookup(barcode, raise_errors=True)
+    except Exception:
+        raise HTTPException(503, "price lookup temporarily unavailable")
     if not info:
         raise HTTPException(404, f"barcode {barcode!r} not found")
     cheapest = info.get("cheapest")
@@ -263,10 +269,11 @@ def _local_health():
         _health_cache_ts = now
         return out
     except Exception:
-        # DB busy — return last cached value or minimal response
+        log.exception("local health check failed")
+        # DB busy/failing — return last cached value (marked degraded) or minimal response
         if _health_cache:
-            return _health_cache
-        return {"status": "local-only", "version": APP_VERSION,
+            return {**_health_cache, "status": "degraded"}
+        return {"status": "degraded", "version": APP_VERSION,
                 "chains_active": 0, "stores": 0, "products": 0, "current_prices": 0}
 
 
@@ -290,6 +297,7 @@ def health():
             "current_prices": prices_n,
         }
     except Exception:
+        log.exception("Supabase health check failed; falling back to local")
         return _local_health()
 
 
