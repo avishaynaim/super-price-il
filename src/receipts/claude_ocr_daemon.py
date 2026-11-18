@@ -63,7 +63,7 @@ def _parse_barcodes(text: str) -> list[str]:
     text = text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
     try:
         d = json.loads(text)
-        return [str(b) for b in d.get("barcodes", [])]
+        return [str(b) for b in d.get("barcodes", []) if re.fullmatch(r"\d{8,14}", str(b))]
     except Exception:
         return re.findall(r"\b\d{13}\b", text)
 
@@ -118,10 +118,10 @@ class _OcrDaemon:
         t0 = time.perf_counter()
         result = subprocess.run(
             ["claude", "-p", prompt,
-             "--allowedTools", "Read",
-             "--output-format", "json",
-             "--dangerously-skip-permissions"],
+             "--allowedTools", f"Read(/{Path(image_path).resolve()})",
+             "--output-format", "json"],
             capture_output=True, text=True, timeout=_TIMEOUT_S,
+            cwd=tempfile.gettempdir(),
         )
         elapsed = time.perf_counter() - t0
         if result.returncode != 0:
