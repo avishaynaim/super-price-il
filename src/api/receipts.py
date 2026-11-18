@@ -173,7 +173,7 @@ async def upload_receipt_batch(
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as t:
                 t.write(data)
                 tmp_paths.append(t.name)
-    except HTTPException:
+    except BaseException:
         for p in tmp_paths:
             try:
                 os.unlink(p)
