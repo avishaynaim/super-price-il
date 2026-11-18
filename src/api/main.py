@@ -527,15 +527,15 @@ def trends(barcode: str, days: int = Query(7, ge=1, le=90)):
         from src.db.local import LOCAL_DB
         c = sqlite3.connect(LOCAL_DB); c.row_factory = sqlite3.Row
         rows = c.execute("""
-            SELECT po.price, po.observed_at,
+            SELECT po.price, po.fetched_at AS observed_at,
                    ch.code AS chain_code, ch.name_he AS chain_name_he
             FROM price_observations po
             JOIN products p ON p.id = po.product_id
             JOIN stores s ON s.id = po.store_id
             JOIN chains ch ON ch.id = s.chain_id
             WHERE p.barcode = ?
-              AND po.observed_at >= datetime('now', ? || ' days')
-            ORDER BY po.observed_at ASC
+              AND po.fetched_at >= datetime('now', ? || ' days')
+            ORDER BY po.fetched_at ASC
         """, (barcode, f"-{days}")).fetchall()
         c.close()
         return [dict(r) for r in rows]
