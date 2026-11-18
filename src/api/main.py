@@ -38,9 +38,18 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # The bundled UI is served same-origin; only explicitly listed origins may
+    # call the API cross-origin. Override with CORS_ALLOW_ORIGINS (comma-separated).
+    allow_origins=[
+        o.strip()
+        for o in os.environ.get(
+            "CORS_ALLOW_ORIGINS",
+            "http://localhost:8000,http://127.0.0.1:8000",
+        ).split(",")
+        if o.strip()
+    ],
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # Force browsers to always fetch fresh JS/CSS (no stale cache served to clients).
