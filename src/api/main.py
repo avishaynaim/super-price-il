@@ -214,6 +214,11 @@ class SearchHit(BaseModel):
 _health_cache: dict = {}
 _health_cache_ts: float = 0.0
 _HEALTH_TTL = 30.0  # seconds
+_RAW_SIZE_TTL = 600.0  # seconds; data/raw tree walk is expensive
+_raw_bytes_cache = None
+_raw_bytes_ts: float = 0.0
+import threading as _threading
+_health_lock = _threading.Lock()
 
 
 def _local_health():
@@ -222,10 +227,11 @@ def _local_health():
     from pathlib import Path
     from src.db.local import LOCAL_DB
 
-    global _health_cache, _health_cache_ts
+    global _health_cache, _health_cache_ts, _raw_bytes_cache, _raw_bytes_ts
     now = time.monotonic()
-    if _health_cache and now - _health_cache_ts < _HEALTH_TTL:
-        return _health_cache
+    with _health_lock:
+        if _health_cache and now - _health_cache_ts < _HEALTH_TTL:
+            return _health_cache
 
     if not LOCAL_DB.exists():
         return {"status": "local-empty", "chains_active": 0, "stores": 0, "products": 0, "current_prices": 0, "version": APP_VERSION}
@@ -237,9 +243,19 @@ def _local_health():
 
         db_bytes = LOCAL_DB.stat().st_size
         raw_root = Path(__file__).resolve().parents[2] / "data" / "raw"
-        raw_bytes = sum(
-            f.stat().st_size for f in raw_root.rglob("*") if f.is_file()
-        ) if raw_root.exists() else 0
+        with _health_lock:
+            raw_cached = _raw_bytes_cache
+            raw_age = now - _raw_bytes_ts
+        if raw_cached is not None and raw_age < _RAW_SIZE_TTL:
+            raw_bytes = raw_cached
+        else:
+            # Full tree walk is expensive: only redo it every _RAW_SIZE_TTL seconds
+            raw_bytes = sum(
+                f.stat().st_size for f in raw_root.rglob("*") if f.is_file()
+            ) if raw_root.exists() else 0
+            with _health_lock:
+                _raw_bytes_cache = raw_bytes
+                _raw_bytes_ts = now
         try:
             free_bytes = shutil.disk_usage(LOCAL_DB.parent).free
         except Exception:
@@ -265,8 +281,9 @@ def _local_health():
             "free_bytes": free_bytes,
         }
         c.close()
-        _health_cache = out
-        _health_cache_ts = now
+        with _health_lock:
+            _health_cache = out
+            _health_cache_ts = now
         return out
     except Exception:
         log.exception("local health check failed")
