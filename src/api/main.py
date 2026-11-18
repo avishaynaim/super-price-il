@@ -413,20 +413,21 @@ def stores(
     ) for r in rows]
 
 
-def _local_search(q: str, chain_codes, city_spellings, limit):
-    import sqlite3
-    from src.db.local import LOCAL_DB
-    c = sqlite3.connect(LOCAL_DB); c.row_factory = sqlite3.Row
-    where = ["(p.name LIKE ? OR p.barcode = ?)"]
-    args  = [f"%{q}%", q]
+def _local_filters(where: list, args: list, chain_codes, city_spellings) -> None:
+    """Append the shared chain/city IN-clauses (SQLite) to where/args."""
     if chain_codes:
-        ph = ",".join(["?"] * len(chain_codes))
-        where.append(f"ch.code IN ({ph})")
+        where.append(f"ch.code IN ({','.join(['?'] * len(chain_codes))})")
         args += chain_codes
     if city_spellings:
-        ph = ",".join(["?"] * len(city_spellings))
-        where.append(f"s.city IN ({ph})")
+        where.append(f"s.city IN ({','.join(['?'] * len(city_spellings))})")
         args += city_spellings
+
+
+def _local_search(q: str, chain_codes, city_spellings, limit):
+    from src.db.local import cursor as _local_cursor
+    where = ["(p.name LIKE ? OR p.barcode = ?)"]
+    args  = [f"%{q}%", q]
+    _local_filters(where, args, chain_codes, city_spellings)
     sql = f"""
       SELECT p.barcode, p.name, p.manufacturer,
              min(cp.price) AS min_price, max(cp.price) AS max_price,
@@ -440,9 +441,8 @@ def _local_search(q: str, chain_codes, city_spellings, limit):
       ORDER BY count(*) DESC
       LIMIT ?"""
     args.append(limit)
-    rows = [dict(r) for r in c.execute(sql, args).fetchall()]
-    c.close()
-    return rows
+    with _local_cursor() as c:
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
 
 
 @app.get("/api/search", response_model=list[SearchHit])
@@ -470,14 +470,9 @@ def search(
 
 
 def _local_product_prices(barcode, chain_codes, city_spellings):
-    import sqlite3
-    from src.db.local import LOCAL_DB
-    c = sqlite3.connect(LOCAL_DB); c.row_factory = sqlite3.Row
+    from src.db.local import cursor as _local_cursor
     where = ["p.barcode = ?"]; args = [barcode]
-    if chain_codes:
-        ph = ",".join(["?"] * len(chain_codes)); where.append(f"ch.code IN ({ph})"); args += chain_codes
-    if city_spellings:
-        ph = ",".join(["?"] * len(city_spellings)); where.append(f"s.city IN ({ph})"); args += city_spellings
+    _local_filters(where, args, chain_codes, city_spellings)
     sql = f"""
       SELECT ch.code AS chain_code, ch.name_he AS chain_name_he,
              s.id AS store_id, s.name AS store_name, s.city AS store_city,
@@ -488,9 +483,8 @@ def _local_product_prices(barcode, chain_codes, city_spellings):
       JOIN chains ch ON ch.id=s.chain_id
       WHERE {' AND '.join(where)}
       ORDER BY cp.price ASC"""
-    rows = [dict(r) for r in c.execute(sql, args).fetchall()]
-    c.close()
-    return rows
+    with _local_cursor() as c:
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
 
 
 @app.get("/api/products/{barcode}", response_model=ProductOut)
@@ -505,11 +499,9 @@ def product(
     chain_codes = _resolve_chain_codes(None, chains)
     city_spellings = compute_city_spellings(city, lat, lng, radius_km)
     if os.environ.get("SUPER_PRICE_LOCAL_ONLY", "").strip() == "1":
-        import sqlite3
-        from src.db.local import LOCAL_DB
-        c = sqlite3.connect(LOCAL_DB); c.row_factory = sqlite3.Row
-        prod = c.execute("SELECT barcode,name,manufacturer,unit_qty,unit_type FROM products WHERE barcode=?", (barcode,)).fetchone()
-        c.close()
+        from src.db.local import cursor as _local_cursor
+        with _local_cursor() as c:
+            prod = c.execute("SELECT barcode,name,manufacturer,unit_qty,unit_type FROM products WHERE barcode=?", (barcode,)).fetchone()
         if not prod: raise HTTPException(404, "product not found")
         prices = _local_product_prices(barcode, chain_codes, city_spellings)
         return ProductOut(
@@ -545,14 +537,9 @@ def compare(
     chain_codes = _resolve_chain_codes(None, chains)
     city_spellings = compute_city_spellings(city, lat, lng, radius_km)
     if os.environ.get("SUPER_PRICE_LOCAL_ONLY", "").strip() == "1":
-        import sqlite3
-        from src.db.local import LOCAL_DB
-        c = sqlite3.connect(LOCAL_DB); c.row_factory = sqlite3.Row
+        from src.db.local import cursor as _local_cursor
         where = ["p.barcode = ?"]; args = [barcode]
-        if chain_codes:
-            ph = ",".join(["?"] * len(chain_codes)); where.append(f"ch.code IN ({ph})"); args += chain_codes
-        if city_spellings:
-            ph = ",".join(["?"] * len(city_spellings)); where.append(f"s.city IN ({ph})"); args += city_spellings
+        _local_filters(where, args, chain_codes, city_spellings)
         sql = f"""
           SELECT ch.code AS chain_code, ch.name_he AS chain_name_he,
                  min(cp.price) AS min_price, max(cp.price) AS max_price,
@@ -564,9 +551,8 @@ def compare(
           WHERE {' AND '.join(where)}
           GROUP BY ch.id
           ORDER BY min_price ASC"""
-        rows = [dict(r) for r in c.execute(sql, args).fetchall()]
-        c.close()
-        return rows
+        with _local_cursor() as c:
+            return [dict(r) for r in c.execute(sql, args).fetchall()]
     res = supa.sb().rpc("compare_product", {
         "p_barcode": barcode,
         "chain_codes": chain_codes,
