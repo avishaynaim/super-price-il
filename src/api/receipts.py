@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import tempfile
 import time
@@ -111,6 +112,7 @@ async def upload_receipt_multi(
     total_paid = None
     chain_guess = None
     photo_count = 0
+    photo_errors: list[dict] = []
 
     for f in files:
         data = await _read_limited(f)
@@ -127,20 +129,33 @@ async def upload_receipt_multi(
                         continue  # overlap — same barcode from adjacent photo
                     seen_barcodes.add(item.barcode)
                 all_items.append(item)
-            if ex.total_paid and not total_paid:
+            # A split receipt may report a partial subtotal on one photo; keep the largest
+            if ex.total_paid and (not total_paid or ex.total_paid > total_paid):
                 total_paid = ex.total_paid
             if ex.chain_guess and not chain_guess:
                 chain_guess = ex.chain_guess
-        except Exception:
+        except Exception as e:
+            logging.getLogger(__name__).exception(
+                "multi-receipt OCR failed for photo %d (%s)", photo_count, f.filename
+            )
+            photo_errors.append(
+                {"photo": photo_count, "filename": f.filename, "error": f"{type(e).__name__}: {e}"}
+            )
             continue  # skip failed photos
 
     if not all_items:
-        raise HTTPException(422, "לא זוהו פריטים באף אחת מהתמונות — נסה לצלם מחדש בתאורה טובה יותר")
+        raise HTTPException(
+            422,
+            {
+                "message": "לא זוהו פריטים באף אחת מהתמונות — נסה לצלם מחדש בתאורה טובה יותר",
+                "photo_errors": photo_errors,
+            },
+        )
 
     merged = Extracted(
         items=all_items, total_paid=total_paid, chain_guess=chain_guess, city=city,
         ai={"provider": provider or "rapid-multi", "photos": photo_count,
-            "barcodes_found": len(seen_barcodes)},
+            "barcodes_found": len(seen_barcodes), "photo_errors": photo_errors},
     )
     return _build_response("photo", merged, city)
 
