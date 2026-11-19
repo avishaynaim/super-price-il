@@ -11,13 +11,21 @@ Endpoints:
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import os
+import shutil
+import sqlite3
+import threading
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..db import supa
 from .geo import geo_router, compute_city_spellings, city_aliases_for_filter
@@ -33,7 +41,31 @@ APP_VERSION = "0.4"
 # Supabase is not available in local/offline mode — always use local SQLite.
 os.environ.setdefault("SUPER_PRICE_LOCAL_ONLY", "1")
 
+_stop_event = threading.Event()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Background preload of the in-memory barcode->price index.
+    from ..db.price_index import price_index
+    price_index.preload_background()
+
+    # Persistent Claude OCR daemon (amortizes the CLI startup cost).
+    from ..receipts.claude_ocr_daemon import ocr_daemon
+    ocr_daemon.start()
+
+    # Cache refresher thread; requests never block on DB.
+    _stop_event.clear()
+    t = threading.Thread(target=_refresh_loop, daemon=True, name="cache-refresher")
+    t.start()
+    try:
+        yield
+    finally:
+        _stop_event.set()
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="super-price-il",
     version=APP_VERSION,
     description="Israeli supermarket price intelligence — Supabase backend",
@@ -56,8 +88,6 @@ app.add_middleware(
 )
 
 # Force browsers to always fetch fresh JS/CSS (no stale cache served to clients).
-from starlette.types import ASGIApp, Receive, Scope, Send
-
 class NoCacheStaticMiddleware:
     """Add Cache-Control: no-store to static assets and the root page.
     Uses raw ASGI (not BaseHTTPMiddleware) so WebSocket connections are
@@ -84,49 +114,26 @@ class NoCacheStaticMiddleware:
 app.add_middleware(NoCacheStaticMiddleware)
 
 
-@app.on_event("startup")
-async def _start_price_index():
-    """Kick off background preload of the in-memory barcode→price index.
-    Server starts immediately; first lookups use live SQL (52ms), subsequent
-    ones hit the RAM cache (<1ms). Full preload completes in ~30s."""
-    from ..db.price_index import price_index
-    price_index.preload_background()
-
-
-@app.on_event("startup")
-async def _start_ocr_daemon():
-    """Start the persistent Claude OCR daemon.
-    Amortizes the 46s CLI startup: subsequent requests take ~15-20s instead of 60s."""
-    from ..receipts.claude_ocr_daemon import ocr_daemon
-    ocr_daemon.start()
-
-
-@app.on_event("startup")
-async def _start_cache_refresher():
-    """Background thread that refreshes slow caches every 10s.
+def _refresh_loop():
+    """Refresh slow caches every 10s until shutdown.
     Requests NEVER block on DB — they always read from the in-memory cache."""
-    import threading, time as _time
     import src.api.stats as _stats
 
-    def _refresh_loop():
-        while True:
-            # health cache
-            try:
-                result = _local_health()
-                # _local_health already updates its own globals
-            except Exception:
-                log.exception("cache-refresher: health refresh failed")
-            # retailers-status cache
-            try:
-                rows = _stats._retailers_status_local()
-                _stats._retailers_cache = rows
-                _stats._retailers_cache_ts = _time.monotonic()
-            except Exception:
-                log.exception("cache-refresher: retailers-status refresh failed")
-            _time.sleep(10)
+    while not _stop_event.is_set():
+        # health cache (_local_health updates its own globals)
+        try:
+            _local_health()
+        except Exception:
+            log.exception("cache-refresher: health refresh failed")
+        # retailers-status cache
+        try:
+            rows = _stats._retailers_status_local()
+            _stats._retailers_cache = rows
+            _stats._retailers_cache_ts = time.monotonic()
+        except Exception:
+            log.exception("cache-refresher: retailers-status refresh failed")
+        _stop_event.wait(10)
 
-    t = threading.Thread(target=_refresh_loop, daemon=True, name="cache-refresher")
-    t.start()
 
 app.include_router(nl_router, prefix="/api")
 app.include_router(receipts_router, prefix="/api")
@@ -217,14 +224,11 @@ _HEALTH_TTL = 30.0  # seconds
 _RAW_SIZE_TTL = 600.0  # seconds; data/raw tree walk is expensive
 _raw_bytes_cache = None
 _raw_bytes_ts: float = 0.0
-import threading as _threading
-_health_lock = _threading.Lock()
+_health_lock = threading.Lock()
 
 
 def _local_health():
     """Local SQLite health — cached for 30s so heavy scraping doesn't block the UI."""
-    import sqlite3, shutil, time
-    from pathlib import Path
     from src.db.local import LOCAL_DB
 
     global _health_cache, _health_cache_ts, _raw_bytes_cache, _raw_bytes_ts
@@ -297,7 +301,6 @@ def _local_health():
 def _is_admin(request: Request) -> bool:
     """True if the caller sent 'Authorization: Bearer <ADMIN_TOKEN>'.
     If ADMIN_TOKEN is not set, nobody is treated as admin."""
-    import hmac
     expected = os.environ.get("ADMIN_TOKEN", "")
     if not expected:
         return False
@@ -346,7 +349,6 @@ def chains():
         res = supa.sb().table("chains").select("code,name_he,name_en,portal_url,active").order("name_he").execute()
         return [ChainOut(**r) for r in (res.data or [])]
     except Exception:
-        import sqlite3
         from src.db.local import LOCAL_DB
         c = sqlite3.connect(LOCAL_DB)
         c.row_factory = sqlite3.Row
@@ -367,7 +369,6 @@ def stores(
     limit: int = Query(500, le=5000),
 ):
     if os.environ.get("SUPER_PRICE_LOCAL_ONLY", "").strip() == "1":
-        import sqlite3
         from src.db.local import LOCAL_DB
 
         l_where: list[str] = []
@@ -611,7 +612,6 @@ def compare(
 @app.get("/api/trends/{barcode}")
 def trends(barcode: str, days: int = Query(7, ge=1, le=90)):
     if os.environ.get("SUPER_PRICE_LOCAL_ONLY", "").strip() == "1":
-        import sqlite3
         from src.db.local import LOCAL_DB
         c = sqlite3.connect(LOCAL_DB); c.row_factory = sqlite3.Row
         rows = c.execute("""
@@ -675,9 +675,7 @@ def _resolve_chain_codes(chain: str | None, chains: str | None) -> list[str] | N
 
 # ---------- settings (stub — always 1-day) ----------
 
-from pydantic import BaseModel as _BM  # noqa: E402
-
-class AppSettings(_BM):
+class AppSettings(BaseModel):
     retention_days: int
 
 
@@ -698,10 +696,7 @@ _WEB_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "web")
 _DIST = os.path.join(_WEB_ROOT, "dist")
 _STATIC = _DIST if os.path.isdir(_DIST) and os.listdir(_DIST) else _WEB_ROOT
 if os.path.isdir(_STATIC) and os.path.isfile(os.path.join(_STATIC, "index.html")):
-    from starlette.staticfiles import StaticFiles as _SF
-    from starlette.types import ASGIApp, Receive, Scope, Send
-
-    class _WSafeStaticFiles(_SF):
+    class _WSafeStaticFiles(StaticFiles):
         """StaticFiles that ignores WebSocket connections (lets them pass through)."""
         async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
             if scope["type"] == "websocket":
