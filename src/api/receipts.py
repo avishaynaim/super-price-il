@@ -30,6 +30,28 @@ MAX_ACTIVE_BATCH_JOBS = int(os.environ.get("MAX_ACTIVE_BATCH_JOBS", 3))
 BATCH_JOB_TTL_SECONDS = int(os.environ.get("BATCH_JOB_TTL_SECONDS", 3600))
 
 
+def _private_upload_dir() -> str:
+    """Per-user temp dir (mode 0700) for uploaded images; stale files are purged."""
+    path = os.path.join(tempfile.gettempdir(), f"superprice-uploads-{os.getuid()}")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.lstat(path)
+    if os.path.islink(path) or st.st_uid != os.getuid():
+        raise RuntimeError(f"unsafe upload temp dir: {path}")
+    os.chmod(path, 0o700)
+    cutoff = time.time() - BATCH_JOB_TTL_SECONDS
+    for name in os.listdir(path):
+        p = os.path.join(path, name)
+        try:
+            if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                os.unlink(p)
+        except OSError:
+            pass
+    return path
+
+
+_UPLOAD_DIR = _private_upload_dir()
+
+
 async def _read_limited(f: UploadFile) -> bytes:
     data = await f.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
@@ -185,7 +207,7 @@ async def upload_receipt_batch(
             data = await _read_limited(f)
             if not data:
                 continue
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as t:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", dir=_UPLOAD_DIR, delete=False) as t:
                 t.write(data)
                 tmp_paths.append(t.name)
     except BaseException:
