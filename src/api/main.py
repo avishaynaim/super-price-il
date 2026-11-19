@@ -114,6 +114,67 @@ class NoCacheStaticMiddleware:
 app.add_middleware(NoCacheStaticMiddleware)
 
 
+class ApiKeyMiddleware:
+    """Require SUPER_PRICE_API_KEY on /api/* HTTP requests and WebSockets.
+
+    The key is accepted via the X-API-Key header, "Authorization: Bearer <key>",
+    or an ``api_key`` query parameter (for browser WebSockets, which cannot set
+    headers). If the env var is unset/empty, no check is made (previous behaviour).
+    The static web UI files and CORS preflight (OPTIONS) are not gated.
+    Raw ASGI so WebSocket upgrades are unaffected.
+    """
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    @staticmethod
+    def _provided(scope: Scope) -> str:
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        key = headers.get(b"x-api-key", b"").decode("latin-1").strip()
+        if not key:
+            auth = headers.get(b"authorization", b"").decode("latin-1")
+            scheme, _, token = auth.partition(" ")
+            if scheme.lower() == "bearer":
+                key = token.strip()
+        if not key:
+            from urllib.parse import parse_qs
+            qs = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+            key = (qs.get("api_key") or [""])[0]
+        return key
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        expected = os.environ.get("SUPER_PRICE_API_KEY", "").strip()
+        stype = scope["type"]
+        if not expected or stype not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        if stype == "http" and (
+            scope.get("method") == "OPTIONS"
+            or not scope.get("path", "").startswith("/api")
+        ):
+            await self.app(scope, receive, send)
+            return
+        if hmac.compare_digest(self._provided(scope).encode(), expected.encode()):
+            await self.app(scope, receive, send)
+            return
+        if stype == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        body = b'{"detail":"Unauthorized"}'
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                (b"www-authenticate", b"Bearer"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+app.add_middleware(ApiKeyMiddleware)
+
+
 def _refresh_loop():
     """Refresh slow caches every 10s until shutdown.
     Requests NEVER block on DB — they always read from the in-memory cache."""
