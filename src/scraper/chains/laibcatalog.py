@@ -15,6 +15,7 @@ from typing import AsyncIterator
 import httpx
 
 from ..base import BaseChainScraper, RemoteFile
+from ..tls import tls_verify
 
 BASE = "https://laibcatalog.co.il"
 
@@ -81,5 +82,5 @@ def make_client_for_laibcatalog() -> httpx.AsyncClient:
         headers={"User-Agent": "super-price-il/0.1 (research)"},
         timeout=120,
         follow_redirects=True,
-        verify=False,
+        verify=tls_verify(),
     )

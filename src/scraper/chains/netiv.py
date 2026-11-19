@@ -27,6 +27,7 @@ from typing import AsyncIterator
 import httpx
 
 from ..base import BaseChainScraper, RemoteFile
+from ..tls import tls_verify
 
 DEFAULT_BASE = "http://141.226.203.152"
 
@@ -107,5 +108,5 @@ def make_client_for_netiv() -> httpx.AsyncClient:
         },
         timeout=120,
         follow_redirects=True,
-        verify=False,
+        verify=tls_verify(),
     )

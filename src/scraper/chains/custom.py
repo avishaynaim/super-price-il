@@ -21,6 +21,7 @@ from typing import AsyncIterator
 import httpx
 
 from ..base import BaseChainScraper, RemoteFile
+from ..tls import tls_verify
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -100,7 +101,7 @@ def make_client_for_mega() -> httpx.AsyncClient:
         headers={"User-Agent": UA, "Accept-Language": "he-IL,he;q=0.9,en;q=0.8"},
         timeout=120,
         follow_redirects=True,
-        verify=False,
+        verify=tls_verify(),
     )
 
 
@@ -155,7 +156,7 @@ def make_client_for_hazi_hinam() -> httpx.AsyncClient:
         headers={"User-Agent": UA, "Accept-Language": "he-IL,he;q=0.9,en;q=0.8"},
         timeout=120,
         follow_redirects=True,
-        verify=False,
+        verify=tls_verify(),
     )
 
 
@@ -240,7 +241,7 @@ def make_client_for_superpharm() -> httpx.AsyncClient:
         headers={"User-Agent": UA, "Accept-Language": "he-IL,he;q=0.9,en;q=0.8"},
         timeout=60,
         follow_redirects=True,
-        verify=False,
+        verify=tls_verify(),
     )
 
 
@@ -289,7 +290,7 @@ def make_client_for_wolt() -> httpx.AsyncClient:
         headers={"User-Agent": UA},
         timeout=60,
         follow_redirects=True,
-        verify=False,
+        verify=tls_verify(),
     )
 
 
@@ -356,7 +357,7 @@ def make_client_for_citymarket() -> httpx.AsyncClient:
         headers={"User-Agent": UA, "Accept-Language": "he-IL,he;q=0.9"},
         timeout=60,
         follow_redirects=True,
-        verify=False,
+        verify=tls_verify(),
     )
 
 
@@ -399,5 +400,5 @@ def make_client_for_chpkt() -> httpx.AsyncClient:
         headers={"User-Agent": UA},
         timeout=60,
         follow_redirects=True,
-        verify=False,
+        verify=tls_verify(),
     )

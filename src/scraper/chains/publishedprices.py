@@ -20,6 +20,7 @@ from typing import AsyncIterator
 import httpx
 
 from ..base import BaseChainScraper, RemoteFile
+from ..tls import tls_verify
 
 DEFAULT_BASE = "https://url.publishedprices.co.il"
 META_CSRF = re.compile(r'<meta name="csrftoken"[^>]*content="([^"]+)"', re.I)
@@ -178,5 +179,5 @@ def make_client_for_publishedprices() -> httpx.AsyncClient:
         headers={"User-Agent": "super-price-il/0.1 (research)"},
         timeout=60,
         follow_redirects=True,
-        verify=False,
+        verify=tls_verify(),
     )

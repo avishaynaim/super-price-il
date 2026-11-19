@@ -11,12 +11,21 @@ Endpoints:
 """
 from __future__ import annotations
 
+import hmac
+import logging
 import os
+import shutil
+import sqlite3
+import threading
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..db import supa
 from .geo import geo_router, compute_city_spellings, city_aliases_for_filter
@@ -25,12 +34,38 @@ from .nl import nl_router
 from .receipts import receipts_router
 from .stats import stats_router
 
+log = logging.getLogger(__name__)
+
 APP_VERSION = "0.4"
 
 # Supabase is not available in local/offline mode — always use local SQLite.
 os.environ.setdefault("SUPER_PRICE_LOCAL_ONLY", "1")
 
+_stop_event = threading.Event()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Background preload of the in-memory barcode->price index.
+    from ..db.price_index import price_index
+    price_index.preload_background()
+
+    # Persistent Claude OCR daemon (amortizes the CLI startup cost).
+    from ..receipts.claude_ocr_daemon import ocr_daemon
+    ocr_daemon.start()
+
+    # Cache refresher thread; requests never block on DB.
+    _stop_event.clear()
+    t = threading.Thread(target=_refresh_loop, daemon=True, name="cache-refresher")
+    t.start()
+    try:
+        yield
+    finally:
+        _stop_event.set()
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="super-price-il",
     version=APP_VERSION,
     description="Israeli supermarket price intelligence — Supabase backend",
@@ -38,14 +73,21 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # The bundled UI is served same-origin; only explicitly listed origins may
+    # call the API cross-origin. Override with CORS_ALLOW_ORIGINS (comma-separated).
+    allow_origins=[
+        o.strip()
+        for o in os.environ.get(
+            "CORS_ALLOW_ORIGINS",
+            "http://localhost:8000,http://127.0.0.1:8000",
+        ).split(",")
+        if o.strip()
+    ],
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # Force browsers to always fetch fresh JS/CSS (no stale cache served to clients).
-from starlette.types import ASGIApp, Receive, Scope, Send
-
 class NoCacheStaticMiddleware:
     """Add Cache-Control: no-store to static assets and the root page.
     Uses raw ASGI (not BaseHTTPMiddleware) so WebSocket connections are
@@ -72,49 +114,87 @@ class NoCacheStaticMiddleware:
 app.add_middleware(NoCacheStaticMiddleware)
 
 
-@app.on_event("startup")
-async def _start_price_index():
-    """Kick off background preload of the in-memory barcode→price index.
-    Server starts immediately; first lookups use live SQL (52ms), subsequent
-    ones hit the RAM cache (<1ms). Full preload completes in ~30s."""
-    from ..db.price_index import price_index
-    price_index.preload_background()
+class ApiKeyMiddleware:
+    """Require SUPER_PRICE_API_KEY on /api/* HTTP requests and WebSockets.
+
+    The key is accepted via the X-API-Key header, "Authorization: Bearer <key>",
+    or an ``api_key`` query parameter (for browser WebSockets, which cannot set
+    headers). If the env var is unset/empty, no check is made (previous behaviour).
+    The static web UI files and CORS preflight (OPTIONS) are not gated.
+    Raw ASGI so WebSocket upgrades are unaffected.
+    """
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    @staticmethod
+    def _provided(scope: Scope) -> str:
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        key = headers.get(b"x-api-key", b"").decode("latin-1").strip()
+        if not key:
+            auth = headers.get(b"authorization", b"").decode("latin-1")
+            scheme, _, token = auth.partition(" ")
+            if scheme.lower() == "bearer":
+                key = token.strip()
+        if not key:
+            from urllib.parse import parse_qs
+            qs = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+            key = (qs.get("api_key") or [""])[0]
+        return key
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        expected = os.environ.get("SUPER_PRICE_API_KEY", "").strip()
+        stype = scope["type"]
+        if not expected or stype not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        if stype == "http" and (
+            scope.get("method") == "OPTIONS"
+            or not scope.get("path", "").startswith("/api")
+        ):
+            await self.app(scope, receive, send)
+            return
+        if hmac.compare_digest(self._provided(scope).encode(), expected.encode()):
+            await self.app(scope, receive, send)
+            return
+        if stype == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        body = b'{"detail":"Unauthorized"}'
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                (b"www-authenticate", b"Bearer"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
 
 
-@app.on_event("startup")
-async def _start_ocr_daemon():
-    """Start the persistent Claude OCR daemon.
-    Amortizes the 46s CLI startup: subsequent requests take ~15-20s instead of 60s."""
-    from ..receipts.claude_ocr_daemon import ocr_daemon
-    ocr_daemon.start()
+app.add_middleware(ApiKeyMiddleware)
 
 
-@app.on_event("startup")
-async def _start_cache_refresher():
-    """Background thread that refreshes slow caches every 10s.
+def _refresh_loop():
+    """Refresh slow caches every 10s until shutdown.
     Requests NEVER block on DB — they always read from the in-memory cache."""
-    import threading, time as _time
     import src.api.stats as _stats
 
-    def _refresh_loop():
-        while True:
-            # health cache
-            try:
-                result = _local_health()
-                # _local_health already updates its own globals
-            except Exception:
-                pass
-            # retailers-status cache
-            try:
-                rows = _stats._retailers_status_local()
-                _stats._retailers_cache = rows
-                _stats._retailers_cache_ts = _time.monotonic()
-            except Exception:
-                pass
-            _time.sleep(10)
+    while not _stop_event.is_set():
+        # health cache (_local_health updates its own globals)
+        try:
+            _local_health()
+        except Exception:
+            log.exception("cache-refresher: health refresh failed")
+        # retailers-status cache
+        try:
+            rows = _stats._retailers_status_local()
+            _stats._retailers_cache = rows
+            _stats._retailers_cache_ts = time.monotonic()
+        except Exception:
+            log.exception("cache-refresher: retailers-status refresh failed")
+        _stop_event.wait(10)
 
-    t = threading.Thread(target=_refresh_loop, daemon=True, name="cache-refresher")
-    t.start()
 
 app.include_router(nl_router, prefix="/api")
 app.include_router(receipts_router, prefix="/api")
@@ -129,7 +209,10 @@ async def lookup_barcode(barcode: str) -> dict:
     Used by the live ZXing scanner so no WebSocket or OCR is needed.
     """
     from ..db.price_index import price_index
-    info = price_index.lookup(barcode)
+    try:
+        info = price_index.lookup(barcode, raise_errors=True)
+    except Exception:
+        raise HTTPException(503, "price lookup temporarily unavailable")
     if not info:
         raise HTTPException(404, f"barcode {barcode!r} not found")
     cheapest = info.get("cheapest")
@@ -199,18 +282,21 @@ class SearchHit(BaseModel):
 _health_cache: dict = {}
 _health_cache_ts: float = 0.0
 _HEALTH_TTL = 30.0  # seconds
+_RAW_SIZE_TTL = 600.0  # seconds; data/raw tree walk is expensive
+_raw_bytes_cache = None
+_raw_bytes_ts: float = 0.0
+_health_lock = threading.Lock()
 
 
 def _local_health():
     """Local SQLite health — cached for 30s so heavy scraping doesn't block the UI."""
-    import sqlite3, shutil, time
-    from pathlib import Path
     from src.db.local import LOCAL_DB
 
-    global _health_cache, _health_cache_ts
+    global _health_cache, _health_cache_ts, _raw_bytes_cache, _raw_bytes_ts
     now = time.monotonic()
-    if _health_cache and now - _health_cache_ts < _HEALTH_TTL:
-        return _health_cache
+    with _health_lock:
+        if _health_cache and now - _health_cache_ts < _HEALTH_TTL:
+            return _health_cache
 
     if not LOCAL_DB.exists():
         return {"status": "local-empty", "chains_active": 0, "stores": 0, "products": 0, "current_prices": 0, "version": APP_VERSION}
@@ -222,9 +308,19 @@ def _local_health():
 
         db_bytes = LOCAL_DB.stat().st_size
         raw_root = Path(__file__).resolve().parents[2] / "data" / "raw"
-        raw_bytes = sum(
-            f.stat().st_size for f in raw_root.rglob("*") if f.is_file()
-        ) if raw_root.exists() else 0
+        with _health_lock:
+            raw_cached = _raw_bytes_cache
+            raw_age = now - _raw_bytes_ts
+        if raw_cached is not None and raw_age < _RAW_SIZE_TTL:
+            raw_bytes = raw_cached
+        else:
+            # Full tree walk is expensive: only redo it every _RAW_SIZE_TTL seconds
+            raw_bytes = sum(
+                f.stat().st_size for f in raw_root.rglob("*") if f.is_file()
+            ) if raw_root.exists() else 0
+            with _health_lock:
+                _raw_bytes_cache = raw_bytes
+                _raw_bytes_ts = now
         try:
             free_bytes = shutil.disk_usage(LOCAL_DB.parent).free
         except Exception:
@@ -250,19 +346,42 @@ def _local_health():
             "free_bytes": free_bytes,
         }
         c.close()
-        _health_cache = out
-        _health_cache_ts = now
+        with _health_lock:
+            _health_cache = out
+            _health_cache_ts = now
         return out
     except Exception:
-        # DB busy — return last cached value or minimal response
+        log.exception("local health check failed")
+        # DB busy/failing — return last cached value (marked degraded) or minimal response
         if _health_cache:
-            return _health_cache
-        return {"status": "local-only", "version": APP_VERSION,
+            return {**_health_cache, "status": "degraded"}
+        return {"status": "degraded", "version": APP_VERSION,
                 "chains_active": 0, "stores": 0, "products": 0, "current_prices": 0}
 
 
+def _is_admin(request: Request) -> bool:
+    """True if the caller sent 'Authorization: Bearer <ADMIN_TOKEN>'.
+    If ADMIN_TOKEN is not set, nobody is treated as admin."""
+    expected = os.environ.get("ADMIN_TOKEN", "")
+    if not expected:
+        return False
+    auth = request.headers.get("authorization", "")
+    scheme, _, token = auth.partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(token.strip(), expected)
+
+
+_DISK_FIELDS = ("db_bytes", "raw_bytes", "free_bytes")
+
+
 @app.get("/api/health")
-def health():
+def health(request: Request):
+    out = _health_impl()
+    if not _is_admin(request):
+        out = {k: v for k, v in out.items() if k not in _DISK_FIELDS}
+    return out
+
+
+def _health_impl():
     # In local-only mode, always use the local helper (it includes disk stats).
     if os.environ.get("SUPER_PRICE_LOCAL_ONLY", "").strip() == "1":
         return _local_health()
@@ -281,6 +400,7 @@ def health():
             "current_prices": prices_n,
         }
     except Exception:
+        log.exception("Supabase health check failed; falling back to local")
         return _local_health()
 
 
@@ -290,7 +410,6 @@ def chains():
         res = supa.sb().table("chains").select("code,name_he,name_en,portal_url,active").order("name_he").execute()
         return [ChainOut(**r) for r in (res.data or [])]
     except Exception:
-        import sqlite3
         from src.db.local import LOCAL_DB
         c = sqlite3.connect(LOCAL_DB)
         c.row_factory = sqlite3.Row
@@ -310,6 +429,51 @@ def stores(
     radius_km: float | None = Query(None, ge=0, le=500),
     limit: int = Query(500, le=5000),
 ):
+    if os.environ.get("SUPER_PRICE_LOCAL_ONLY", "").strip() == "1":
+        from src.db.local import LOCAL_DB
+
+        l_where: list[str] = []
+        l_args: list = []
+        if chain:
+            l_where.append("ch.code = ?")
+            l_args.append(chain)
+        elif chains:
+            l_codes = [c.strip() for c in chains.split(",") if c.strip()]
+            if l_codes:
+                l_where.append(f"ch.code IN ({','.join(['?'] * len(l_codes))})")
+                l_args += l_codes
+        l_cities = compute_city_spellings(city, lat, lng, radius_km)
+        if l_cities is not None:
+            if not l_cities:
+                return []
+            l_where.append(f"s.city IN ({','.join(['?'] * len(l_cities))})")
+            l_args += l_cities
+        l_sql = f"""
+            SELECT s.id, s.store_code, s.name, s.city, s.address,
+                   ch.code AS chain_code, ch.name_he AS chain_name_he
+            FROM stores s
+            JOIN chains ch ON ch.id = s.chain_id
+            {("WHERE " + " AND ".join(l_where)) if l_where else ""}
+            ORDER BY s.city
+            LIMIT ?
+        """
+        l_args.append(limit)
+        conn = sqlite3.connect(LOCAL_DB)
+        conn.row_factory = sqlite3.Row
+        try:
+            l_rows = [dict(r) for r in conn.execute(l_sql, l_args).fetchall()]
+        finally:
+            conn.close()
+        return [StoreOut(
+            id=r["id"],
+            chain_code=r["chain_code"],
+            chain_name_he=r["chain_name_he"],
+            store_code=r["store_code"],
+            name=r.get("name"),
+            city=r.get("city"),
+            address=r.get("address"),
+        ) for r in l_rows]
+
     from ..db.pg import cursor as _cursor
 
     where_parts: list[str] = []
@@ -358,20 +522,21 @@ def stores(
     ) for r in rows]
 
 
-def _local_search(q: str, chain_codes, city_spellings, limit):
-    import sqlite3
-    from src.db.local import LOCAL_DB
-    c = sqlite3.connect(LOCAL_DB); c.row_factory = sqlite3.Row
-    where = ["(p.name LIKE ? OR p.barcode = ?)"]
-    args  = [f"%{q}%", q]
+def _local_filters(where: list, args: list, chain_codes, city_spellings) -> None:
+    """Append the shared chain/city IN-clauses (SQLite) to where/args."""
     if chain_codes:
-        ph = ",".join(["?"] * len(chain_codes))
-        where.append(f"ch.code IN ({ph})")
+        where.append(f"ch.code IN ({','.join(['?'] * len(chain_codes))})")
         args += chain_codes
     if city_spellings:
-        ph = ",".join(["?"] * len(city_spellings))
-        where.append(f"s.city IN ({ph})")
+        where.append(f"s.city IN ({','.join(['?'] * len(city_spellings))})")
         args += city_spellings
+
+
+def _local_search(q: str, chain_codes, city_spellings, limit):
+    from src.db.local import cursor as _local_cursor
+    where = ["(p.name LIKE ? OR p.barcode = ?)"]
+    args  = [f"%{q}%", q]
+    _local_filters(where, args, chain_codes, city_spellings)
     sql = f"""
       SELECT p.barcode, p.name, p.manufacturer,
              min(cp.price) AS min_price, max(cp.price) AS max_price,
@@ -385,9 +550,8 @@ def _local_search(q: str, chain_codes, city_spellings, limit):
       ORDER BY count(*) DESC
       LIMIT ?"""
     args.append(limit)
-    rows = [dict(r) for r in c.execute(sql, args).fetchall()]
-    c.close()
-    return rows
+    with _local_cursor() as c:
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
 
 
 @app.get("/api/search", response_model=list[SearchHit])
@@ -415,14 +579,9 @@ def search(
 
 
 def _local_product_prices(barcode, chain_codes, city_spellings):
-    import sqlite3
-    from src.db.local import LOCAL_DB
-    c = sqlite3.connect(LOCAL_DB); c.row_factory = sqlite3.Row
+    from src.db.local import cursor as _local_cursor
     where = ["p.barcode = ?"]; args = [barcode]
-    if chain_codes:
-        ph = ",".join(["?"] * len(chain_codes)); where.append(f"ch.code IN ({ph})"); args += chain_codes
-    if city_spellings:
-        ph = ",".join(["?"] * len(city_spellings)); where.append(f"s.city IN ({ph})"); args += city_spellings
+    _local_filters(where, args, chain_codes, city_spellings)
     sql = f"""
       SELECT ch.code AS chain_code, ch.name_he AS chain_name_he,
              s.id AS store_id, s.name AS store_name, s.city AS store_city,
@@ -433,9 +592,8 @@ def _local_product_prices(barcode, chain_codes, city_spellings):
       JOIN chains ch ON ch.id=s.chain_id
       WHERE {' AND '.join(where)}
       ORDER BY cp.price ASC"""
-    rows = [dict(r) for r in c.execute(sql, args).fetchall()]
-    c.close()
-    return rows
+    with _local_cursor() as c:
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
 
 
 @app.get("/api/products/{barcode}", response_model=ProductOut)
@@ -450,11 +608,9 @@ def product(
     chain_codes = _resolve_chain_codes(None, chains)
     city_spellings = compute_city_spellings(city, lat, lng, radius_km)
     if os.environ.get("SUPER_PRICE_LOCAL_ONLY", "").strip() == "1":
-        import sqlite3
-        from src.db.local import LOCAL_DB
-        c = sqlite3.connect(LOCAL_DB); c.row_factory = sqlite3.Row
-        prod = c.execute("SELECT barcode,name,manufacturer,unit_qty,unit_type FROM products WHERE barcode=?", (barcode,)).fetchone()
-        c.close()
+        from src.db.local import cursor as _local_cursor
+        with _local_cursor() as c:
+            prod = c.execute("SELECT barcode,name,manufacturer,unit_qty,unit_type FROM products WHERE barcode=?", (barcode,)).fetchone()
         if not prod: raise HTTPException(404, "product not found")
         prices = _local_product_prices(barcode, chain_codes, city_spellings)
         return ProductOut(
@@ -490,14 +646,9 @@ def compare(
     chain_codes = _resolve_chain_codes(None, chains)
     city_spellings = compute_city_spellings(city, lat, lng, radius_km)
     if os.environ.get("SUPER_PRICE_LOCAL_ONLY", "").strip() == "1":
-        import sqlite3
-        from src.db.local import LOCAL_DB
-        c = sqlite3.connect(LOCAL_DB); c.row_factory = sqlite3.Row
+        from src.db.local import cursor as _local_cursor
         where = ["p.barcode = ?"]; args = [barcode]
-        if chain_codes:
-            ph = ",".join(["?"] * len(chain_codes)); where.append(f"ch.code IN ({ph})"); args += chain_codes
-        if city_spellings:
-            ph = ",".join(["?"] * len(city_spellings)); where.append(f"s.city IN ({ph})"); args += city_spellings
+        _local_filters(where, args, chain_codes, city_spellings)
         sql = f"""
           SELECT ch.code AS chain_code, ch.name_he AS chain_name_he,
                  min(cp.price) AS min_price, max(cp.price) AS max_price,
@@ -509,9 +660,8 @@ def compare(
           WHERE {' AND '.join(where)}
           GROUP BY ch.id
           ORDER BY min_price ASC"""
-        rows = [dict(r) for r in c.execute(sql, args).fetchall()]
-        c.close()
-        return rows
+        with _local_cursor() as c:
+            return [dict(r) for r in c.execute(sql, args).fetchall()]
     res = supa.sb().rpc("compare_product", {
         "p_barcode": barcode,
         "chain_codes": chain_codes,
@@ -523,19 +673,18 @@ def compare(
 @app.get("/api/trends/{barcode}")
 def trends(barcode: str, days: int = Query(7, ge=1, le=90)):
     if os.environ.get("SUPER_PRICE_LOCAL_ONLY", "").strip() == "1":
-        import sqlite3
         from src.db.local import LOCAL_DB
         c = sqlite3.connect(LOCAL_DB); c.row_factory = sqlite3.Row
         rows = c.execute("""
-            SELECT po.price, po.observed_at,
+            SELECT po.price, po.fetched_at AS observed_at,
                    ch.code AS chain_code, ch.name_he AS chain_name_he
             FROM price_observations po
             JOIN products p ON p.id = po.product_id
             JOIN stores s ON s.id = po.store_id
             JOIN chains ch ON ch.id = s.chain_id
             WHERE p.barcode = ?
-              AND po.observed_at >= datetime('now', ? || ' days')
-            ORDER BY po.observed_at ASC
+              AND po.fetched_at >= datetime('now', ? || ' days')
+            ORDER BY po.fetched_at ASC
         """, (barcode, f"-{days}")).fetchall()
         c.close()
         return [dict(r) for r in rows]
@@ -587,9 +736,7 @@ def _resolve_chain_codes(chain: str | None, chains: str | None) -> list[str] | N
 
 # ---------- settings (stub — always 1-day) ----------
 
-from pydantic import BaseModel as _BM  # noqa: E402
-
-class AppSettings(_BM):
+class AppSettings(BaseModel):
     retention_days: int
 
 
@@ -599,7 +746,9 @@ def get_app_settings():
 
 
 @app.put("/api/app-settings", response_model=AppSettings)
-def update_app_settings(settings: AppSettings):
+def update_app_settings(settings: AppSettings, request: Request):
+    if not _is_admin(request):
+        raise HTTPException(401, "Unauthorized")
     return AppSettings(retention_days=1)
 
 
@@ -608,10 +757,7 @@ _WEB_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "web")
 _DIST = os.path.join(_WEB_ROOT, "dist")
 _STATIC = _DIST if os.path.isdir(_DIST) and os.listdir(_DIST) else _WEB_ROOT
 if os.path.isdir(_STATIC) and os.path.isfile(os.path.join(_STATIC, "index.html")):
-    from starlette.staticfiles import StaticFiles as _SF
-    from starlette.types import ASGIApp, Receive, Scope, Send
-
-    class _WSafeStaticFiles(_SF):
+    class _WSafeStaticFiles(StaticFiles):
         """StaticFiles that ignores WebSocket connections (lets them pass through)."""
         async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
             if scope["type"] == "websocket":

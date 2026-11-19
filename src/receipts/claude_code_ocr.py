@@ -63,18 +63,24 @@ Return ONLY valid JSON — no markdown, no explanation:
 
 # ── subprocess runner ─────────────────────────────────────────────────────────
 
-def _run_claude(prompt: str, timeout: int = 120) -> str:
-    """Run claude -p and return the text result. Raises on failure."""
+def _run_claude(prompt: str, timeout: int = 120, image_path: str | Path | None = None) -> str:
+    """Run claude -p and return the text result. Raises on failure.
+
+    No permission bypass: Read is allowed only for the single image given.
+    """
+    if image_path is None:
+        raise ValueError("image_path is required to scope the Read permission")
+    abs_img = str(Path(image_path).resolve())
     result = subprocess.run(
         [
             "claude", "-p", prompt,
-            "--allowedTools", "Read",
+            "--allowedTools", f"Read(/{abs_img})",
             "--output-format", "json",
-            "--dangerously-skip-permissions",
         ],
         capture_output=True,
         text=True,
         timeout=timeout,
+        cwd=tempfile.gettempdir(),
     )
     if result.returncode != 0:
         raise RuntimeError(f"claude CLI exited {result.returncode}: {result.stderr[:300]}")
@@ -136,7 +142,7 @@ def extract_barcodes(image_path: str | Path, timeout: int = 120) -> list[str]:
     path, is_temp = _prepare_image(image_path)
     try:
         prompt = _BARCODE_PROMPT.format(path=path)
-        raw = _run_claude(prompt, timeout=timeout)
+        raw = _run_claude(prompt, timeout=timeout, image_path=path)
     finally:
         if is_temp:
             try:
@@ -145,7 +151,7 @@ def extract_barcodes(image_path: str | Path, timeout: int = 120) -> list[str]:
                 pass
     try:
         d = _parse_json_from_text(raw)
-        return [str(b) for b in d.get("barcodes", [])]
+        return [str(b) for b in d.get("barcodes", []) if re.fullmatch(r"\d{8,14}", str(b))]
     except Exception:
         return re.findall(r"\b\d{13}\b", raw)
 
@@ -176,7 +182,7 @@ def parse_receipt(image_path: str | Path, timeout: int = 180) -> dict:
     """
     path = str(Path(image_path).resolve())
     prompt = _FULL_RECEIPT_PROMPT.format(path=path)
-    raw = _run_claude(prompt, timeout=timeout)
+    raw = _run_claude(prompt, timeout=timeout, image_path=path)
     try:
         return _parse_json_from_text(raw)
     except Exception:
