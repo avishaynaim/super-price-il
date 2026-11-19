@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import os
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -294,8 +294,30 @@ def _local_health():
                 "chains_active": 0, "stores": 0, "products": 0, "current_prices": 0}
 
 
+def _is_admin(request: Request) -> bool:
+    """True if the caller sent 'Authorization: Bearer <ADMIN_TOKEN>'.
+    If ADMIN_TOKEN is not set, nobody is treated as admin."""
+    import hmac
+    expected = os.environ.get("ADMIN_TOKEN", "")
+    if not expected:
+        return False
+    auth = request.headers.get("authorization", "")
+    scheme, _, token = auth.partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(token.strip(), expected)
+
+
+_DISK_FIELDS = ("db_bytes", "raw_bytes", "free_bytes")
+
+
 @app.get("/api/health")
-def health():
+def health(request: Request):
+    out = _health_impl()
+    if not _is_admin(request):
+        out = {k: v for k, v in out.items() if k not in _DISK_FIELDS}
+    return out
+
+
+def _health_impl():
     # In local-only mode, always use the local helper (it includes disk stats).
     if os.environ.get("SUPER_PRICE_LOCAL_ONLY", "").strip() == "1":
         return _local_health()
@@ -665,7 +687,9 @@ def get_app_settings():
 
 
 @app.put("/api/app-settings", response_model=AppSettings)
-def update_app_settings(settings: AppSettings):
+def update_app_settings(settings: AppSettings, request: Request):
+    if not _is_admin(request):
+        raise HTTPException(401, "Unauthorized")
     return AppSettings(retention_days=1)
 
 
