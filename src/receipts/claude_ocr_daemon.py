@@ -1,15 +1,14 @@
 """Persistent Claude Code OCR daemon.
 
-Keeps one `claude -p` process alive across requests to amortize the ~46s
-startup cost. Each request still takes ~15-20s (model inference), vs 60s
-for cold-start CLI. Start at server boot; the first request primes it.
+Serialises OCR requests through a single background worker. Each request
+spawns a `claude -p` subprocess (it is not a persistent process). Start at
+server boot.
 
 Usage:
     from .claude_ocr_daemon import ocr_daemon
     barcodes = await ocr_daemon.extract_barcodes("/path/to/photo.jpg")
 
 Architecture:
-    - A single subprocess is started (or restarted on failure).
     - Requests are serialised through an asyncio.Queue — one at a time.
     - A background worker task reads from the queue and processes sequentially.
     - Callers await a Future that resolves when their result arrives.
@@ -60,10 +59,13 @@ def _resize_to_tmp(image_path: str) -> tuple[str, bool]:
 
 def _parse_barcodes(text: str) -> list[str]:
     """Extract barcodes from JSON or raw text."""
-    text = text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+    text = text.strip()
+    m = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        text = m.group(1).strip()
     try:
         d = json.loads(text)
-        return [str(b) for b in d.get("barcodes", [])]
+        return [str(b) for b in d.get("barcodes", []) if re.fullmatch(r"\d{8,14}", str(b))]
     except Exception:
         return re.findall(r"\b\d{13}\b", text)
 
@@ -76,7 +78,7 @@ class _OcrDaemon:
 
     def start(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         """Call once from FastAPI startup."""
-        lp = loop or asyncio.get_event_loop()
+        lp = loop or asyncio.get_running_loop()
         self._queue = asyncio.Queue()
         self._worker_task = lp.create_task(self._worker())
         log.info("OCR daemon started")
@@ -88,21 +90,25 @@ class _OcrDaemon:
         return await asyncio.wait_for(fut, timeout=timeout)
 
     async def _worker(self) -> None:
-        """Process OCR requests one at a time using a reused subprocess."""
-        proc: subprocess.Popen | None = None
-
+        """Process OCR requests one at a time."""
         while True:
             image_path, fut = await self._queue.get()
+            if fut.done():  # caller already timed out / cancelled
+                self._queue.task_done()
+                continue
             tmp_path, is_tmp = _resize_to_tmp(image_path)
             try:
-                barcodes = await asyncio.get_event_loop().run_in_executor(
+                barcodes = await asyncio.get_running_loop().run_in_executor(
                     None, self._call_claude, tmp_path
                 )
                 if not fut.done():
                     fut.set_result(barcodes)
-            except Exception as e:
+            except BaseException as e:
+                # Never let the worker die silently; fail the request instead.
                 if not fut.done():
-                    fut.set_exception(e)
+                    fut.set_exception(e if isinstance(e, Exception) else RuntimeError(repr(e)))
+                if not isinstance(e, Exception):
+                    raise
             finally:
                 if is_tmp:
                     try:
@@ -118,10 +124,10 @@ class _OcrDaemon:
         t0 = time.perf_counter()
         result = subprocess.run(
             ["claude", "-p", prompt,
-             "--allowedTools", "Read",
-             "--output-format", "json",
-             "--dangerously-skip-permissions"],
+             "--allowedTools", f"Read(/{Path(image_path).resolve()})",
+             "--output-format", "json"],
             capture_output=True, text=True, timeout=_TIMEOUT_S,
+            cwd=tempfile.gettempdir(),
         )
         elapsed = time.perf_counter() - t0
         if result.returncode != 0:

@@ -21,3 +21,6 @@ data/raw/
 node_modules/
 web/dist/
 web/.vite/
+
+# Real receipt photos (personal data) - keep local only
+tests/fixtures/receipts/

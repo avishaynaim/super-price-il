@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 import time
 from typing import Any
@@ -50,6 +51,9 @@ live_ocr_router = APIRouter()
 # recall for ~3× speedup. Receipts in the viewfinder are usually big enough
 # that 800px is plenty.
 LIVE_MAX_LONG_SIDE = 1600  # higher res = more digits readable; speed is secondary
+
+# Max size of one WebSocket text message (base64 frame), in characters (~10 MB default)
+MAX_WS_MESSAGE_CHARS = int(os.environ.get("MAX_WS_MESSAGE_CHARS", 14 * 1024 * 1024))
 
 
 def _classify(text: str) -> str:
@@ -133,6 +137,9 @@ async def live_ocr(ws: WebSocket) -> None:
         try:
             while True:
                 msg = await ws.receive_text()
+                if len(msg) > MAX_WS_MESSAGE_CHARS:
+                    await ws.close(code=1009)
+                    return
                 try:
                     obj = json.loads(msg)
                 except json.JSONDecodeError:

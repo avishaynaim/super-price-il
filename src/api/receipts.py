@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import tempfile
+import time
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
@@ -21,6 +23,52 @@ from ..receipts.pipeline import (
 
 receipts_router = APIRouter()
 
+# Upload / job limits (overridable via env)
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
+MAX_FILES_PER_REQUEST = int(os.environ.get("MAX_FILES_PER_REQUEST", 10))
+MAX_ACTIVE_BATCH_JOBS = int(os.environ.get("MAX_ACTIVE_BATCH_JOBS", 3))
+BATCH_JOB_TTL_SECONDS = int(os.environ.get("BATCH_JOB_TTL_SECONDS", 3600))
+
+
+def _private_upload_dir() -> str:
+    """Per-user temp dir (mode 0700) for uploaded images; stale files are purged."""
+    path = os.path.join(tempfile.gettempdir(), f"superprice-uploads-{os.getuid()}")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.lstat(path)
+    if os.path.islink(path) or st.st_uid != os.getuid():
+        raise RuntimeError(f"unsafe upload temp dir: {path}")
+    os.chmod(path, 0o700)
+    cutoff = time.time() - BATCH_JOB_TTL_SECONDS
+    for name in os.listdir(path):
+        p = os.path.join(path, name)
+        try:
+            if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                os.unlink(p)
+        except OSError:
+            pass
+    return path
+
+
+_UPLOAD_DIR = _private_upload_dir()
+
+
+async def _read_limited(f: UploadFile) -> bytes:
+    data = await f.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"file too large (max {MAX_UPLOAD_BYTES} bytes)")
+    return data
+
+
+def _check_file_count(files: list) -> None:
+    if len(files) > MAX_FILES_PER_REQUEST:
+        raise HTTPException(413, f"too many files (max {MAX_FILES_PER_REQUEST})")
+
+
+def _purge_batch_jobs() -> None:
+    cutoff = time.time() - BATCH_JOB_TTL_SECONDS
+    for k in [k for k, v in _batch_jobs.items() if v.get("_ts", 0) < cutoff]:
+        _batch_jobs.pop(k, None)
+
 
 @receipts_router.post("/receipts")
 async def upload_receipt(
@@ -33,7 +81,7 @@ async def upload_receipt(
     `provider` selects the OCR backend (overrides OCR_PROVIDER env):
       claude (default) | rapid | ocrspace | auto
     """
-    data = await file.read()
+    data = await _read_limited(file)
     if not data:
         raise HTTPException(400, "empty file")
 
@@ -79,15 +127,17 @@ async def upload_receipt_multi(
     """
     if not files:
         raise HTTPException(400, "no files")
+    _check_file_count(files)
 
     all_items: list[ExtractedItem] = []
     seen_barcodes: set[str] = set()
     total_paid = None
     chain_guess = None
     photo_count = 0
+    photo_errors: list[dict] = []
 
     for f in files:
-        data = await f.read()
+        data = await _read_limited(f)
         if not data:
             continue
         photo_count += 1
@@ -101,20 +151,33 @@ async def upload_receipt_multi(
                         continue  # overlap — same barcode from adjacent photo
                     seen_barcodes.add(item.barcode)
                 all_items.append(item)
-            if ex.total_paid and not total_paid:
+            # A split receipt may report a partial subtotal on one photo; keep the largest
+            if ex.total_paid and (not total_paid or ex.total_paid > total_paid):
                 total_paid = ex.total_paid
             if ex.chain_guess and not chain_guess:
                 chain_guess = ex.chain_guess
-        except Exception:
+        except Exception as e:
+            logging.getLogger(__name__).exception(
+                "multi-receipt OCR failed for photo %d (%s)", photo_count, f.filename
+            )
+            photo_errors.append(
+                {"photo": photo_count, "filename": f.filename, "error": f"{type(e).__name__}: {e}"}
+            )
             continue  # skip failed photos
 
     if not all_items:
-        raise HTTPException(422, "לא זוהו פריטים באף אחת מהתמונות — נסה לצלם מחדש בתאורה טובה יותר")
+        raise HTTPException(
+            422,
+            {
+                "message": "לא זוהו פריטים באף אחת מהתמונות — נסה לצלם מחדש בתאורה טובה יותר",
+                "photo_errors": photo_errors,
+            },
+        )
 
     merged = Extracted(
         items=all_items, total_paid=total_paid, chain_guess=chain_guess, city=city,
         ai={"provider": provider or "rapid-multi", "photos": photo_count,
-            "barcodes_found": len(seen_barcodes)},
+            "barcodes_found": len(seen_barcodes), "photo_errors": photo_errors},
     )
     return _build_response("photo", merged, city)
 
@@ -132,21 +195,35 @@ async def upload_receipt_batch(
     """
     if not files:
         raise HTTPException(400, "no files")
+    _check_file_count(files)
+
+    _purge_batch_jobs()
+    if sum(1 for v in _batch_jobs.values() if v.get("status") == "processing") >= MAX_ACTIVE_BATCH_JOBS:
+        raise HTTPException(429, "too many batch jobs in progress — try again later")
 
     tmp_paths: list[str] = []
-    for f in files:
-        data = await f.read()
-        if not data:
-            continue
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as t:
-            t.write(data)
-            tmp_paths.append(t.name)
+    try:
+        for f in files:
+            data = await _read_limited(f)
+            if not data:
+                continue
+            with tempfile.NamedTemporaryFile(suffix=".jpg", dir=_UPLOAD_DIR, delete=False) as t:
+                t.write(data)
+                tmp_paths.append(t.name)
+    except BaseException:
+        for p in tmp_paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        raise
 
     if not tmp_paths:
         raise HTTPException(400, "all files empty")
 
     job_id = str(uuid.uuid4())[:8]
-    _batch_jobs[job_id] = {"status": "processing", "photos": len(tmp_paths), "city": city}
+    _batch_jobs[job_id] = {"status": "processing", "photos": len(tmp_paths), "city": city,
+                          "_ts": time.time()}
 
     background_tasks.add_task(_run_batch_job, job_id, tmp_paths, city)
     return {"job_id": job_id, "status": "processing", "photos": len(tmp_paths),
@@ -160,7 +237,7 @@ async def get_batch_job(job_id: str) -> dict:
     job = _batch_jobs.get(job_id)
     if not job:
         raise HTTPException(404, f"job {job_id!r} not found")
-    return job
+    return {k: v for k, v in job.items() if k != "_ts"}
 
 
 def _run_batch_job(job_id: str, tmp_paths: list[str], city: str | None) -> None:
@@ -176,9 +253,9 @@ def _run_batch_job(job_id: str, tmp_paths: list[str], city: str | None) -> None:
             ai={"provider": "claude-code-batch", "photos": len(tmp_paths), "barcodes_found": len(barcodes)},
         )
         result = _build_response("photo", ex, city)
-        _batch_jobs[job_id] = {"status": "done", **result}
+        _batch_jobs[job_id] = {"status": "done", "_ts": time.time(), **result}
     except Exception as e:
-        _batch_jobs[job_id] = {"status": "error", "error": str(e)}
+        _batch_jobs[job_id] = {"status": "error", "error": str(e), "_ts": time.time()}
     finally:
         for p in tmp_paths:
             try:

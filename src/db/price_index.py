@@ -47,13 +47,21 @@ class PriceIndex:
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def lookup(self, barcode: str) -> dict[str, Any] | None:
-        """Return price info for a barcode. Cache miss → live SQL (52ms)."""
+    def lookup(self, barcode: str, raise_errors: bool = False) -> dict[str, Any] | None:
+        """Return price info for a barcode. Cache miss → live SQL (52ms).
+
+        Returns None when not found. DB errors are logged; they return None
+        too unless raise_errors=True, in which case they propagate."""
         with self._lock:
             if barcode in self._cache:
                 return self._cache[barcode]
 
-        result = self._fetch(barcode)
+        try:
+            result = self._fetch(barcode)
+        except Exception:
+            if raise_errors:
+                raise
+            return None
         if result:
             with self._lock:
                 self._cache[barcode] = result
@@ -178,7 +186,8 @@ class PriceIndex:
                 "priciest":     priciest,
             }
         except Exception:
-            return None
+            log.exception("PriceIndex: live fetch failed for barcode %r", barcode)
+            raise
 
 
 # Singleton — import and use directly
