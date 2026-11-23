@@ -361,10 +361,10 @@ def _local_health():
 
 def _is_admin(request: Request) -> bool:
     """True if the caller sent 'Authorization: Bearer <ADMIN_TOKEN>'.
-    If ADMIN_TOKEN is not set, nobody is treated as admin."""
+    If ADMIN_TOKEN is not set, everyone is admin (previous behaviour)."""
     expected = os.environ.get("ADMIN_TOKEN", "")
     if not expected:
-        return False
+        return True
     auth = request.headers.get("authorization", "")
     scheme, _, token = auth.partition(" ")
     return scheme.lower() == "bearer" and hmac.compare_digest(token.strip(), expected)

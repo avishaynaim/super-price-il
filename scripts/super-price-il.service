@@ -18,8 +18,9 @@ StandardError=journal
 # Run unprivileged: this job parses untrusted retailer files.
 # Create the account once, e.g.: useradd --system --home /opt/super-price-il --shell /usr/sbin/nologin superprice
 # and make the repo (data/, raw/) writable by it: chown -R superprice: /opt/super-price-il/data /opt/super-price-il/raw
-User=superprice
-Group=superprice
+# Uncomment once the account exists and owns the data dirs:
+#User=superprice
+#Group=superprice
 # Sandboxing. The repo dir stays writable for data/ (SQLite, settings) and raw/.
 NoNewPrivileges=true
 ProtectSystem=strict

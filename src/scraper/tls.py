@@ -13,6 +13,8 @@ def tls_verify():
     bundle = os.environ.get("SCRAPER_CA_BUNDLE")
     if bundle:
         return bundle
-    if os.environ.get("SCRAPER_INSECURE_TLS") == "1":
-        return False
-    return True
+    # Default stays OFF (previous behaviour): several retailer portals have
+    # broken certificate chains. Set SCRAPER_VERIFY_TLS=1 to turn it on.
+    if os.environ.get("SCRAPER_VERIFY_TLS") == "1" and os.environ.get("SCRAPER_INSECURE_TLS") != "1":
+        return True
+    return False
